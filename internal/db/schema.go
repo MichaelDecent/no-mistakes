@@ -139,6 +139,32 @@ CREATE TABLE IF NOT EXISTS intent_cache (
     session_id  TEXT NOT NULL,
     created_at  INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS repo_watches (
+    id                    TEXT PRIMARY KEY,
+    repo_id               TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    kind                  TEXT NOT NULL,
+    pattern               TEXT NOT NULL,
+    mode                  TEXT NOT NULL,
+    enabled               INTEGER NOT NULL DEFAULT 1,
+    poll_interval_seconds INTEGER,
+    daily_at              TEXT,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL,
+    UNIQUE (repo_id, kind, pattern, mode)
+);
+
+CREATE TABLE IF NOT EXISTS watch_state (
+    watch_id             TEXT NOT NULL REFERENCES repo_watches(id) ON DELETE CASCADE,
+    ref                  TEXT NOT NULL,
+    last_seen_sha        TEXT NOT NULL,
+    last_run_id          TEXT,
+    last_status          TEXT,
+    last_run_at          INTEGER,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    updated_at           INTEGER NOT NULL,
+    PRIMARY KEY (watch_id, ref)
+);
 `
 
 // migrationStatements hold additive schema changes applied to databases that
@@ -220,4 +246,54 @@ var migrationStatements = []string{
 	`ALTER TABLE agent_invocations ADD COLUMN workload_files INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN workload_lines INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN finding_count INTEGER`,
+	// Connected repositories: registered by remote URL from the operator's
+	// configuration rather than by `init` in a working clone. SQLite permits
+	// ADD COLUMN ... NOT NULL DEFAULT <constant>, so every existing row reads
+	// back 'local' with no table rewrite - which is what those repos are.
+	`ALTER TABLE repos ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'local'`,
+	// The canonical credential-free "<host>/<path>" identity of a connected
+	// repository's remote. It is what the repo ID is derived from, so it is
+	// stable across transports and credential rotation.
+	`ALTER TABLE repos ADD COLUMN source_identity TEXT`,
+	// The operator-chosen handle. It is the CLI selector and display label and
+	// is deliberately NOT part of the ID, so renaming an entry preserves the
+	// gate and every run row.
+	`ALTER TABLE repos ADD COLUMN source_name TEXT`,
+	// Nullable and never backfilled: a row that was never reconciled cannot
+	// prove it was ever in configuration. A timestamp means configuration no
+	// longer lists it, and the gate plus run history are deliberately retained.
+	`ALTER TABLE repos ADD COLUMN detached_at INTEGER`,
+	// A run's declared scope. NULL reads back as the author gate in fix-pr
+	// mode, which is exactly what every run recorded before QA existed was.
+	`ALTER TABLE runs ADD COLUMN run_kind TEXT`,
+	`ALTER TABLE runs ADD COLUMN run_mode TEXT`,
+	// Promotes the trigger string already threaded through run creation from
+	// telemetry-only into durable provenance.
+	`ALTER TABLE runs ADD COLUMN trigger TEXT`,
+	// The run's declared skip set as a JSON array of step names. It duplicates
+	// the per-step 'skipped' statuses on purpose: those are the mechanism, this
+	// is the auditable declaration made before any step ran.
+	`ALTER TABLE runs ADD COLUMN skipped_steps TEXT`,
+	`ALTER TABLE runs ADD COLUMN watch_id TEXT`,
+	// The QA verdict about the CODE, kept strictly separate from runs.status,
+	// which is about the RUN. NULL for gate runs and every historical row, so
+	// no existing consumer of runs.status changes meaning.
+	`ALTER TABLE runs ADD COLUMN qa_verdict TEXT`,
+	// A bounded reason a QA report could not be published. Publication is
+	// subordinate to the run and never fails it, so its failure needs a home.
+	`ALTER TABLE runs ADD COLUMN qa_report_error TEXT`,
+	// Who released each gate round and why. Nullable and never backfilled: a
+	// historical round cannot prove which mechanism answered it.
+	`ALTER TABLE step_rounds ADD COLUMN gate_action TEXT`,
+	`ALTER TABLE step_rounds ADD COLUMN gate_action_source TEXT`,
+	`ALTER TABLE step_rounds ADD COLUMN gate_action_reason TEXT`,
+	// MUST stay last, and MUST NOT move into schemaSQL. schemaSQL's
+	// CREATE TABLE IF NOT EXISTS is a no-op on an existing database, so an index
+	// declared there would run before source_identity existed and Open would
+	// hard-fail for every installed user - the loop above tolerates only
+	// "duplicate column name". Here it runs after the ADD COLUMN lines, and
+	// IF NOT EXISTS keeps it idempotent. SQLite unique indexes ignore NULLs, so
+	// every local row (source_identity NULL) coexists.
+	// Regression: TestUniqueSourceIdentityIndexAppliesToUpgradedDatabases.
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_source_identity ON repos (source_identity)`,
 }

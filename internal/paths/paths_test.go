@@ -3,6 +3,7 @@ package paths
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -118,7 +119,7 @@ func TestEnsureDirs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, d := range []string{p.Root(), p.ReposDir(), p.WorktreesDir(), p.LogsDir(), p.ServerPIDsDir()} {
+	for _, d := range []string{p.Root(), p.ReposDir(), p.SourcesDir(), p.WorktreesDir(), p.LogsDir(), p.ServerPIDsDir()} {
 		info, err := os.Stat(d)
 		if err != nil {
 			t.Errorf("expected dir %q to exist: %v", d, err)
@@ -127,5 +128,53 @@ func TestEnsureDirs(t *testing.T) {
 		if !info.IsDir() {
 			t.Errorf("expected %q to be a directory", d)
 		}
+	}
+}
+
+// TestEnsureDirsDoesNotCreateQAReportsDir pins the same rule EvalDir follows:
+// disabling a feature must leave no state behind, so the reports directory is
+// created by the reporter that writes into it and not by startup.
+func TestEnsureDirsDoesNotCreateQAReportsDir(t *testing.T) {
+	dir := t.TempDir()
+	p := WithRoot(filepath.Join(dir, "nm"))
+
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{p.QAReportsDir(), p.EvalDir()} {
+		if _, err := os.Stat(d); !os.IsNotExist(err) {
+			t.Errorf("EnsureDirs created %q (stat err = %v); it must be created on first use instead", d, err)
+		}
+	}
+}
+
+// TestConnectedRepoPathsAreDistinctFromTheGate pins that a connected
+// repository's identity stub and its bare gate are different directories. If
+// SourceDir ever collapsed onto RepoDir, the URL refresh path would read the
+// gate's origin - which carries the full credentialled URL by design - and
+// persist it into the database.
+func TestConnectedRepoPathsAreDistinctFromTheGate(t *testing.T) {
+	p := WithRoot(filepath.Join(t.TempDir(), "nm"))
+	const repoID = "aabbccddeeff"
+
+	source := p.SourceDir(repoID)
+	gate := p.RepoDir(repoID)
+
+	if source == gate {
+		t.Fatal("SourceDir equals RepoDir; the identity stub must never be the gate")
+	}
+	if filepath.Dir(source) != p.SourcesDir() {
+		t.Errorf("SourceDir parent = %q, want %q", filepath.Dir(source), p.SourcesDir())
+	}
+	if filepath.Dir(gate) != p.ReposDir() {
+		t.Errorf("RepoDir parent = %q, want %q", filepath.Dir(gate), p.ReposDir())
+	}
+	// The stub must not sit under ReposDir, or the gate-context classifier would
+	// have to reason about whether it is a gate.
+	if strings.HasPrefix(source, p.ReposDir()+string(filepath.Separator)) {
+		t.Errorf("SourceDir %q is under ReposDir; the gate classifier scans that directory", source)
+	}
+	if p.QARunReportDir("run-1") != filepath.Join(p.QAReportsDir(), "run-1") {
+		t.Errorf("QARunReportDir = %q, want it under QAReportsDir", p.QARunReportDir("run-1"))
 	}
 }

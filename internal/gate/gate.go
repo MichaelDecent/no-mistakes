@@ -183,6 +183,35 @@ func validateForkRouting(ctx context.Context, upstreamURL, forkURL string) error
 // the working repo to the gate and the gate to its upstream. Every step is
 // idempotent so this doubles as the repair path for re-running init.
 func provisionGate(ctx context.Context, bareDir, absRoot, upstreamURL, reposDir string, refresh bool) error {
+	if err := provisionGateCore(ctx, bareDir, upstreamURL); err != nil {
+		return err
+	}
+
+	if err := ensureWorkingRemote(ctx, absRoot, bareDir, reposDir, refresh); err != nil {
+		return fmt.Errorf("add remote: %w", err)
+	}
+
+	return nil
+}
+
+// provisionGateCore creates or repairs everything about a gate that does not
+// involve a working clone: the bare repo, push-option advertisement, the managed
+// receive hooks, hook-path isolation, and the gate's own origin remote.
+//
+// It is split out so a connected repository - registered by remote URL, with no
+// developer clone to attach a "no-mistakes" remote to - produces a gate that is
+// byte-for-byte the same shape as an init-created one. That single gate shape is
+// load-bearing: startup gate migration and the gate-config stamp byte-compare the
+// pre-receive script for every directory under the repos dir, so a second gate
+// shape would mean a second stamp variant and a permanently failing check.
+//
+// Both receive hooks are installed even though the daemon only ever FETCHES into
+// a connected gate (a fetch cannot fire receive hooks; only a push can). The
+// pre-receive hook is a fail-closed admission guard, not a notification: anything
+// able to reach the gate directory can push into it, and a connected gate is more
+// exposed than a local one because no developer owns the directory and the objects
+// belong to someone else's repository. Omitting it would reopen that bypass.
+func provisionGateCore(ctx context.Context, bareDir, upstreamURL string) error {
 	// Create the bare repo. git init --bare is a no-op on an existing one.
 	if err := git.InitBare(ctx, bareDir); err != nil {
 		return fmt.Errorf("create bare repo: %w", err)
@@ -212,10 +241,6 @@ func provisionGate(ctx context.Context, bareDir, absRoot, upstreamURL, reposDir 
 	// context from detached worktrees created from the gate.
 	if err := git.EnsureRemote(ctx, bareDir, "origin", upstreamURL); err != nil {
 		return fmt.Errorf("add gate origin remote: %w", err)
-	}
-
-	if err := ensureWorkingRemote(ctx, absRoot, bareDir, reposDir, refresh); err != nil {
-		return fmt.Errorf("add remote: %w", err)
 	}
 
 	return nil

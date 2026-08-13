@@ -497,31 +497,20 @@ func ciReadyToMerge(rv runView) bool {
 	return false
 }
 
-// gateResolution decides how --yes answers an approval gate. A gate with
-// actionable findings (anything other than purely informational "no-op") is
-// fixed with every finding selected, unless this step was already fixed once -
-// in which case the gate is approved so the run converges instead of looping on
-// a finding the fix cannot clear. Gates with only non-actionable findings, no
-// findings, or actionable findings that carry no IDs (which a fix would resolve
-// to zero selections) are approved.
+// gateResolution decides how --yes answers an approval gate. It adapts a
+// stepView to types.ResolveConvergingGate, which owns the rule itself so the
+// daemon's unattended QA gate policy answers gates identically instead of
+// carrying a second copy of the same judgement.
+//
+// Unparseable findings JSON is treated as "no actionable findings" and approves,
+// which is what this function has always done: a gate whose findings cannot be
+// read offers no IDs to select, so a fix would resolve to zero selections.
 func gateResolution(gate stepView, alreadyFixed bool) (types.ApprovalAction, []string) {
-	if alreadyFixed || gate.Status == string(types.StepStatusFixReview) {
-		return types.ActionApprove, nil
-	}
 	parsed, err := types.ParseFindingsJSON(gate.FindingsJSON)
-	if err != nil || !types.HasActionableFindings(parsed) {
+	if err != nil {
 		return types.ActionApprove, nil
 	}
-	ids := make([]string, 0, len(parsed.Items))
-	for _, f := range parsed.Items {
-		if f.ID != "" {
-			ids = append(ids, f.ID)
-		}
-	}
-	if len(ids) == 0 {
-		return types.ActionApprove, nil
-	}
-	return types.ActionFix, ids
+	return types.ResolveConvergingGate(parsed, alreadyFixed, gate.Status == string(types.StepStatusFixReview))
 }
 
 // waitStepLeavesGate blocks until the named step's status changes away from the

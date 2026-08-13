@@ -632,6 +632,46 @@ func ResolveRef(ctx context.Context, dir, ref string) (string, error) {
 	return out, nil
 }
 
+// ListBranchRefs returns every local branch in a BARE repository as a map from
+// full ref name ("refs/heads/main") to commit object name. Tags and
+// remote-tracking refs are excluded: only branches are watchable.
+//
+// bareDir must be a bare gate directory, which is the only thing that needs
+// enumerating: a watcher fetches a connected repository's branches into its gate
+// and then reads what landed. LsRemote answers a single named ref and so cannot
+// serve a glob pattern, and a fetch of refs/heads/* is one network round trip
+// rather than one per branch.
+//
+// It routes through RunBare rather than Run for the same fail-closed reason
+// startup gate migration does: RunBare names the repository explicitly and never
+// falls back to cwd-based discovery, so a malformed directory under the
+// application root fails loudly instead of walking up into an unrelated ancestor
+// worktree and reporting that repository's branches as work to validate.
+func ListBranchRefs(ctx context.Context, bareDir string) (map[string]string, error) {
+	out, err := RunBare(ctx, bareDir, "for-each-ref", "--format=%(refname)%09%(objectname)", "refs/heads/")
+	if err != nil {
+		return nil, fmt.Errorf("list branch refs: %w", err)
+	}
+	refs := make(map[string]string)
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		name, object, ok := strings.Cut(line, "\t")
+		if !ok {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		object = strings.TrimSpace(object)
+		if name == "" || object == "" {
+			continue
+		}
+		refs[name] = object
+	}
+	return refs, nil
+}
+
 // RefExists reports whether the given ref resolves to a commit. It uses
 // `git rev-parse --verify --quiet` so a missing ref is a clean (nil, false)
 // result rather than a loud error.
