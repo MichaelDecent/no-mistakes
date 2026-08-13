@@ -11,11 +11,13 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/evidence"
+	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 	"github.com/kunchenguid/no-mistakes/internal/winproc"
 	"gopkg.in/yaml.v3"
@@ -1211,9 +1213,61 @@ func LoadGlobal(path string) (*GlobalConfig, error) {
 	return LoadGlobalFromBytes(data)
 }
 
+// credentialURLPattern finds a scheme-qualified URL carrying userinfo, in any
+// scheme, so a credential is caught wherever it appears in a configuration
+// document. It deliberately does not reuse safeurl's own pattern, which matches
+// only http and https: broadening that one would also rewrite the conventional,
+// non-secret "git@" user in ssh URLs inside every error message that already
+// flows through safeurl.RedactText, making diagnostics worse for no gain.
+//
+// The trailing character class stops at whitespace and at YAML quoting and
+// comment characters, so a quoted scalar keeps its quotes and a trailing comment
+// is not swallowed into the URL.
+var credentialURLPattern = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^\s/?#'"]*@[^\s'"#]+`)
+
+// RedactConfigSource removes credentials from configuration bytes before they are
+// stored anywhere.
+//
+// This exists because GlobalConfig.SourceYAML is not merely read: it is copied
+// into Config.ReplayGlobalYAML by EnableEvalProvenance, written to
+// step_rounds.global_config_yaml on every review round, and copied onto disk by
+// eval capture - and both eval.capture_provenance and eval.auto_capture default
+// to true. Connecting repositories by remote URL makes it ordinary for
+// configuration to name URLs, and operators embed tokens in URLs, so without this
+// one token in config.yaml would be persisted verbatim and repeatedly.
+//
+// Redaction is textual rather than a YAML round trip, so a document with no
+// credential is returned byte-for-byte unchanged: comments, key order, and
+// formatting all survive, and a real redaction stands out instead of hiding in a
+// wholesale rewrite. It also cannot fail, which matters on a path that must never
+// turn a loadable configuration into an unloadable one.
+//
+// It is deliberately not limited to the URL fields this project knows about. Any
+// scheme'd URL with userinfo anywhere in the document is redacted, because the
+// cost of over-redacting a value used only for replay provenance is nil and the
+// cost of missing one is a persisted secret.
+func RedactConfigSource(data []byte) []byte {
+	if len(data) == 0 {
+		return data
+	}
+	if !bytes.Contains(data, []byte("@")) {
+		// No userinfo is possible without an "@", so the overwhelmingly common
+		// case does no regexp work and returns the original slice.
+		return data
+	}
+	redacted := credentialURLPattern.ReplaceAllStringFunc(string(data), safeurl.Redact)
+	if redacted == string(data) {
+		return data
+	}
+	return []byte(redacted)
+}
+
 func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	cfg := DefaultGlobalConfig()
-	cfg.SourceYAML = append([]byte(nil), data...)
+	// Store redacted bytes, never the raw ones. See RedactConfigSource: these
+	// bytes reach SQLite and the on-disk eval corpus on every review round, so a
+	// credential must be removed here rather than at any later consumer.
+	cfg.SourceYAML = append([]byte(nil), RedactConfigSource(data)...)
 	var raw globalConfigRaw
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)

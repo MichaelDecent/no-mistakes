@@ -438,6 +438,14 @@ Local review-evaluation corpus settings for [`no-mistakes eval`](/no-mistakes/re
 
 These are operator settings for this machine's local disk, so they are global-only: an `eval` block in a repository's `.no-mistakes.yaml` is ignored. Corpus storage stays under `<NM_HOME>/eval` and no-mistakes never uploads it; replay still sends code to the selected agent's configured model provider as described in the [Evaluation toolkit](/no-mistakes/reference/eval/).
 
+## Credentials in this file
+
+Provenance records the configuration a review pass ran under, so with `eval.capture_provenance` on this file's contents are stored in the local database with every review round, and copied into the corpus under `<NM_HOME>/eval` by automatic collection.
+
+Credentials are removed before any of that: a URL carrying userinfo has it replaced with `redacted` on load, wherever the URL appears and whatever its scheme, so a token in this file is never persisted. The host and path survive so provenance still identifies what a captured case was configured against.
+
+Prefer keeping the token out of the file regardless. SSH keys, a git credential helper, and `gh auth` all work without naming a secret here, and the redaction is a safety net rather than a reason to paste one in.
+
 ## Environment variables
 
 See [Environment Variables](/no-mistakes/reference/environment/) for `NM_HOME`, `NM_DAEMON_CONNECT_TIMEOUT`, Bitbucket Cloud credentials, and update-check suppression.
