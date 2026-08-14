@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/kunchenguid/no-mistakes/internal/buildinfo"
@@ -118,7 +119,7 @@ func findRepo(d *db.DB) (*db.Repo, error) {
 		return nil, fmt.Errorf("get repo: %w", err)
 	}
 	if repo != nil {
-		return repo, nil
+		return refuseConnectedRepo(repo)
 	}
 	// Try the main worktree root (handles git worktrees).
 	mainRoot, err := git.FindMainRepoRoot(".")
@@ -132,7 +133,27 @@ func findRepo(d *db.DB) (*db.Repo, error) {
 	if repo == nil {
 		return nil, fmt.Errorf("repo not initialized (run 'no-mistakes init' first)")
 	}
-	return repo, nil
+	return refuseConnectedRepo(repo)
+}
+
+// refuseConnectedRepo rejects a connected repository at the CLI choke point.
+//
+// findRepo answers "which repository is this working directory", which a
+// connected repository has no answer to: it is registered from the operator's
+// configuration by remote URL and its working_path is a daemon-owned identity
+// stub, not a checkout. Every cwd-based author surface resolves through here, so
+// this one refusal covers sync, runs, attach, rerun, status, and axi. It names
+// the repository by its operator-chosen name and never by URL, which for a
+// connected repository routinely carries a token.
+func refuseConnectedRepo(repo *db.Repo) (*db.Repo, error) {
+	if !repo.Connected() {
+		return repo, nil
+	}
+	name := strings.TrimSpace(repo.SourceName)
+	if name == "" {
+		name = repo.ID
+	}
+	return nil, fmt.Errorf("%q is a connected repository with no developer checkout, so this command does not apply to it; see 'no-mistakes repos show %s'", name, name)
 }
 
 // openResources initializes paths, ensures directories exist, and opens the DB.

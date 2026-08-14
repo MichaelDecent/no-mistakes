@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -29,8 +30,13 @@ type StepStats struct {
 
 // RepoStats summarizes historical usage for one repository.
 type RepoStats struct {
-	RepoID           string
-	WorkingPath      string
+	RepoID string
+	// WorkingPath is a developer checkout for a local repository and a
+	// daemon-owned identity stub for a connected one.
+	WorkingPath string
+	// SourceName is the operator-chosen name of a connected repository, empty
+	// for a local one.
+	SourceName       string
 	Runs             int
 	RescueRuns       int
 	ReportedFindings int
@@ -38,7 +44,14 @@ type RepoStats struct {
 }
 
 // DisplayName returns a compact repository name for terminal reports.
+//
+// A connected repository is named by its operator-chosen name: the base of its
+// working_path is the bare hex repo ID of an identity stub, which tells a reader
+// nothing.
 func (r RepoStats) DisplayName() string {
+	if name := strings.TrimSpace(r.SourceName); name != "" {
+		return name
+	}
 	name := filepath.Base(r.WorkingPath)
 	if name == "." || name == string(filepath.Separator) || name == "" {
 		return r.WorkingPath
@@ -57,7 +70,7 @@ func (d *DB) GetStats() (*Stats, error) {
 	stepStats := map[types.StepName]*StepStats{}
 
 	for _, repo := range repos {
-		repoStats := RepoStats{RepoID: repo.ID, WorkingPath: repo.WorkingPath}
+		repoStats := RepoStats{RepoID: repo.ID, WorkingPath: repo.WorkingPath, SourceName: repo.SourceName}
 		runs, err := d.GetRunsByRepo(repo.ID)
 		if err != nil {
 			return nil, err

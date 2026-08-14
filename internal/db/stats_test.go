@@ -1,6 +1,7 @@
 package db
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -179,4 +180,38 @@ func assertStepStat(t *testing.T, stats []StepStats, step types.StepName, report
 		return
 	}
 	t.Fatalf("missing stats for step %s", step)
+}
+
+// TestRepoStatsDisplayNamePrefersSourceName pins that stats names a connected
+// repository by its operator-chosen name. The base of a connected repo's
+// working_path is the bare hex repo ID of an identity stub, which tells a reader
+// nothing, while a local repository keeps its checkout's directory name.
+func TestRepoStatsDisplayNamePrefersSourceName(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stats RepoStats
+		want  string
+	}{
+		{
+			name:  "connected repo uses its source name",
+			stats: RepoStats{RepoID: "aabbccddeeff", WorkingPath: "/nm/sources/aabbccddeeff", SourceName: "acme-api"},
+			want:  "acme-api",
+		},
+		{
+			name:  "local repo keeps the checkout directory name",
+			stats: RepoStats{RepoID: "112233445566", WorkingPath: filepath.Join("/home", "dev", "my-project")},
+			want:  "my-project",
+		},
+		{
+			name:  "blank source name falls back to the path",
+			stats: RepoStats{RepoID: "112233445566", WorkingPath: filepath.Join("/home", "dev", "my-project"), SourceName: "   "},
+			want:  "my-project",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.stats.DisplayName(); got != tc.want {
+				t.Errorf("DisplayName() = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

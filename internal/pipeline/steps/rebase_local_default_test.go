@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -149,5 +150,67 @@ func TestRebaseStep_DetectsUnpushedLocalDefaultBranchCommitsOnForcePush(t *testi
 	}
 	if !strings.Contains(outcome.Findings, "unrelated local main work") {
 		t.Fatalf("expected findings to mention the bundled local main commit, got: %s", outcome.Findings)
+	}
+}
+
+// TestDetectBundledLocalDefaultCommitsSkipsConnectedRepos is an A/B on the one
+// field that changed: the identical fixture yields the blocking finding for a
+// local repository and nothing for a connected one.
+//
+// A connected repository has no developer checkout, so "the branch bundles the
+// local default branch's unpushed commits" is not a question that exists for it.
+// Its WorkingPath is a refless identity stub that would read as "no local
+// default tip" anyway, but this finding is blocking and NOT auto-fixable, so the
+// guard must be explicit rather than rely on the stub staying refless.
+func TestDetectBundledLocalDefaultCommitsSkipsConnectedRepos(t *testing.T) {
+	t.Parallel()
+	upstream := t.TempDir()
+	gitCmd(t, upstream, "init", "--bare")
+
+	working := t.TempDir()
+	gitCmd(t, working, "init")
+	gitCmd(t, working, "config", "user.name", "test")
+	gitCmd(t, working, "config", "user.email", "test@test.com")
+	gitCmd(t, working, "checkout", "-b", "main")
+	os.WriteFile(filepath.Join(working, "base.txt"), []byte("base"), 0o644)
+	gitCmd(t, working, "add", "-A")
+	gitCmd(t, working, "commit", "-m", "base")
+	d0 := gitCmd(t, working, "rev-parse", "HEAD")
+	gitCmd(t, working, "remote", "add", "origin", upstream)
+	gitCmd(t, working, "push", "origin", "main")
+
+	os.WriteFile(filepath.Join(working, "unrelated.txt"), []byte("backend"), 0o644)
+	gitCmd(t, working, "add", "-A")
+	gitCmd(t, working, "commit", "-m", "unrelated backend work")
+	localMainTip := gitCmd(t, working, "rev-parse", "HEAD")
+
+	dir := t.TempDir()
+	gitCmd(t, dir, "clone", upstream, ".")
+	gitCmd(t, dir, "config", "user.name", "test")
+	gitCmd(t, dir, "config", "user.email", "test@test.com")
+	gitCmd(t, dir, "fetch", working, "main")
+	gitCmd(t, dir, "checkout", "--detach", localMainTip)
+	gitCmd(t, dir, "checkout", "-b", "feature")
+	os.WriteFile(filepath.Join(dir, "my_fix.txt"), []byte("fix"), 0o644)
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "my fix")
+	headSHA := gitCmd(t, dir, "rev-parse", "HEAD")
+
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, d0, headSHA, config.Commands{})
+	sctx.Run.Branch = "refs/heads/feature"
+	sctx.Repo.UpstreamURL = upstream
+	sctx.Repo.WorkingPath = working
+
+	// Baseline: as a local repository this fixture must produce the finding, or
+	// the connected half below would pass for the wrong reason.
+	if outcome := detectBundledLocalDefaultCommits(t.Context(), sctx, "feature", "main"); outcome == nil {
+		t.Fatal("local repository baseline produced no finding; the fixture no longer exercises the detector")
+	}
+
+	sctx.Repo.SourceKind = db.SourceKindConnected
+	sctx.Repo.SourceIdentity = "example.test/acme/api"
+	sctx.Repo.SourceName = "acme-api"
+	if outcome := detectBundledLocalDefaultCommits(t.Context(), sctx, "feature", "main"); outcome != nil {
+		t.Fatalf("connected repository produced a bundled-commits outcome: %#v", outcome)
 	}
 }

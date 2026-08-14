@@ -29,6 +29,61 @@ func repoID(absPath string) string {
 	return fmt.Sprintf("%x", h[:6])
 }
 
+// refuseDaemonOwnedRoot rejects a workDir inside state this daemon owns: a
+// connected repository's identity stub under SourcesDir, a bare gate under
+// ReposDir, or a run worktree under WorktreesDir.
+//
+// Registering any of those as a developer checkout would let author-side
+// commands mutate daemon-owned state, and for a stub would make branch
+// synchronization treat a refless placeholder as a branch. The gates and
+// worktrees cases close a pre-existing gap that predates connected
+// repositories: nothing previously stopped `no-mistakes init` inside either.
+//
+// Symlink resolution matters on macOS, where TempDir sits under /var -> /private/var.
+func refuseDaemonOwnedRoot(p *paths.Paths, workDir string) error {
+	if p == nil {
+		return nil
+	}
+	target := resolvePathForCompare(workDir)
+	for _, owned := range []struct {
+		dir  string
+		what string
+	}{
+		{p.SourcesDir(), "a connected repository's identity stub"},
+		{p.ReposDir(), "a no-mistakes bare gate"},
+		{p.WorktreesDir(), "a no-mistakes run worktree"},
+	} {
+		if pathIsWithin(target, resolvePathForCompare(owned.dir)) {
+			return fmt.Errorf("%s is inside %s, which no-mistakes owns; run this from your own checkout instead", workDir, owned.what)
+		}
+	}
+	return nil
+}
+
+// resolvePathForCompare makes a path comparable: absolute, symlink-resolved
+// where possible, and cleaned. It degrades to the cleaned input rather than
+// failing, because a not-yet-existing directory is a legitimate input.
+func resolvePathForCompare(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = filepath.Clean(path)
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return filepath.Clean(abs)
+}
+
+// pathIsWithin reports whether target is root or lives beneath it. It compares
+// path elements rather than string prefixes, so "/a/bc" is not within "/a/b".
+func pathIsWithin(target, root string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 // Init sets up a no-mistakes gate for the git repo at workDir.
 // It creates a bare repo, installs the post-receive hook, best-effort
 // isolates the bare repo's hooks path from shared local config writes when
@@ -54,6 +109,9 @@ func InitWithFork(ctx context.Context, d *db.DB, p *paths.Paths, workDir, forkUR
 		return nil, false, err
 	} else if classified.Nested {
 		return nil, false, fmt.Errorf("%s", gatecontext.RefusalMessage(classified))
+	}
+	if err := refuseDaemonOwnedRoot(p, workDir); err != nil {
+		return nil, false, err
 	}
 	forkURL = strings.TrimSpace(forkURL)
 
@@ -312,6 +370,9 @@ func Eject(ctx context.Context, d *db.DB, p *paths.Paths, workDir string) (*db.R
 	} else if classified.Nested {
 		return nil, fmt.Errorf("%s", gatecontext.RefusalMessage(classified))
 	}
+	if err := refuseDaemonOwnedRoot(p, workDir); err != nil {
+		return nil, err
+	}
 	// Normalize worktrees back to the main repo root so eject works no matter
 	// which checkout the user runs it from.
 	gitRoot, err := git.FindMainRepoRoot(workDir)
@@ -327,6 +388,16 @@ func Eject(ctx context.Context, d *db.DB, p *paths.Paths, workDir string) (*db.R
 	}
 	if repo == nil {
 		return nil, fmt.Errorf("not initialized for %s", absRoot)
+	}
+	// Eject exists to detach a developer's clone from its gate. A connected
+	// repository has no clone, and everything below this point deletes its gate
+	// and worktrees, so it must be removed only by the explicit operator command.
+	if repo.Connected() {
+		name := strings.TrimSpace(repo.SourceName)
+		if name == "" {
+			name = repo.ID
+		}
+		return nil, fmt.Errorf("%q is a connected repository, so there is no working clone to eject; remove it with 'no-mistakes repos remove %s'", name, name)
 	}
 
 	// Remove remote from working repo (non-fatal).
