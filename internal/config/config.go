@@ -179,6 +179,13 @@ type RepoSpecRaw struct {
 	// on purpose: absent and false are structurally the same no-op, and no YAML
 	// value may clear a repository's own trusted true.
 	DisableProjectSettings bool `yaml:"disable_project_settings"`
+	// AllowProjectInstructions lowers the connected-repository DEFAULT that
+	// turns DisableProjectSettings on. It exists because with the floor on and
+	// EnsureGateNeutralized failing closed, only agents with a verified
+	// suppression knob can launch, so an operator whose only agent lacks one
+	// would otherwise be unable to QA anything. It never clears a repository's
+	// own trusted true, and an explicit DisableProjectSettings still wins.
+	AllowProjectInstructions bool `yaml:"allow_project_instructions"`
 	// ForkURL is parsed only so a value can be REJECTED with a clear message
 	// rather than silently ignored by KnownFields. Fork routing is GitHub-parent
 	// plus GitHub-fork only (validateForkRouting) and is out of scope for
@@ -200,7 +207,50 @@ type RepoSpec struct {
 	CommitName    string
 	CommitEmail   string
 
+	DisableProjectSettings   bool
+	AllowProjectInstructions bool
+}
+
+// RepoPolicy is the operator's per-repository floor, applied on top of a
+// repository's own trusted configuration as effective = trustedRepoValue OR
+// floor.
+//
+// Every field is a plain bool rather than a pointer so that absent and false
+// are structurally the same no-op. That is what makes the floor monotone by
+// construction: there is no representable value that CLEARS a restriction a
+// repository set for itself, so no configuration mistake can weaken a
+// repository's own choice.
+type RepoPolicy struct {
 	DisableProjectSettings bool
+}
+
+// RepoPolicyFor resolves the operator floor for a repository by its
+// operator-chosen name. An unknown or empty name - which is every local
+// repository, since only connected repositories are declared - yields the zero
+// policy, so local behaviour is unchanged by construction.
+//
+// A declared connected repository defaults to DisableProjectSettings on: the
+// operator cannot edit a watched repository, so its AGENTS.md or CLAUDE.md is
+// untrusted input to the agent that will run against it. AllowProjectInstructions
+// lowers that default; an explicit DisableProjectSettings re-raises it, because
+// naming the restriction is a clearer signal of intent than opting out of a
+// default.
+func (g *GlobalConfig) RepoPolicyFor(name string) RepoPolicy {
+	if g == nil {
+		return RepoPolicy{}
+	}
+	spec, ok := g.Repos[strings.TrimSpace(name)]
+	if !ok {
+		return RepoPolicy{}
+	}
+	disable := true
+	if spec.AllowProjectInstructions {
+		disable = false
+	}
+	if spec.DisableProjectSettings {
+		disable = true
+	}
+	return RepoPolicy{DisableProjectSettings: disable}
 }
 
 // globalConfigRaw is the on-disk YAML representation with duration as string.
@@ -1952,13 +2002,14 @@ func resolveReposRaw(raw map[string]RepoSpecRaw) (map[string]RepoSpec, error) {
 			return nil, fmt.Errorf("repos.%s: fork_url is not supported for connected repositories", name)
 		}
 		resolved[name] = RepoSpec{
-			Name:                   name,
-			URL:                    url,
-			CredentialEnv:          strings.TrimSpace(spec.CredentialEnv),
-			DefaultBranch:          strings.TrimSpace(spec.DefaultBranch),
-			CommitName:             strings.TrimSpace(spec.CommitName),
-			CommitEmail:            strings.TrimSpace(spec.CommitEmail),
-			DisableProjectSettings: spec.DisableProjectSettings,
+			Name:                     name,
+			URL:                      url,
+			CredentialEnv:            strings.TrimSpace(spec.CredentialEnv),
+			DefaultBranch:            strings.TrimSpace(spec.DefaultBranch),
+			CommitName:               strings.TrimSpace(spec.CommitName),
+			CommitEmail:              strings.TrimSpace(spec.CommitEmail),
+			DisableProjectSettings:   spec.DisableProjectSettings,
+			AllowProjectInstructions: spec.AllowProjectInstructions,
 		}
 	}
 	return resolved, nil
@@ -2069,7 +2120,36 @@ func (c *Config) AutoFixLimit(step types.StepName) int {
 // Merge combines global and per-repo config. Per-repo agent values, including
 // ordered fallback lists, override global agent values when non-empty. Commands
 // and ignore patterns come from repo config only.
+//
+// Merge is exactly MergeWithRepoPolicy with an empty policy, which is what
+// keeps every existing caller's behaviour identical.
 func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
+	return MergeWithRepoPolicy(global, repo, RepoPolicy{})
+}
+
+// MergeWithRepoPolicy is Merge plus the operator's monotone floor.
+//
+// The floor is applied HERE, in the merge, rather than at the agent
+// construction site, because that is what makes it reach both a fresh run and a
+// crash-recovered one: both paths merge configuration, and only one of them
+// builds an agent from scratch. newPipelineAgent needs no change - it already
+// reads cfg.DisableProjectSettings for agent.Options and for the fail-closed
+// EnsureGateNeutralized check.
+//
+// EffectiveRepoConfig is deliberately untouched: disable_project_settings stays
+// trusted-only there, and this floor is a separate, later lift applied on top
+// of whatever trusted resolution already decided.
+func MergeWithRepoPolicy(global *GlobalConfig, repo *RepoConfig, policy RepoPolicy) *Config {
+	cfg := mergeConfig(global, repo)
+	// effective = trustedRepoValue OR operatorFloor. Never an assignment, which
+	// could lower a repository's own trusted true.
+	if policy.DisableProjectSettings {
+		cfg.DisableProjectSettings = true
+	}
+	return cfg
+}
+
+func mergeConfig(global *GlobalConfig, repo *RepoConfig) *Config {
 	af := autoFixDefaults()
 	applyAutoFixOverrides(&af, &global.AutoFix)
 	applyAutoFixOverrides(&af, &repo.AutoFix)

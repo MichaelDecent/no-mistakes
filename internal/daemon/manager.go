@@ -232,7 +232,7 @@ func (m *RunManager) loadRecoveredConfig(ctx context.Context, run *db.Run, repo 
 	trustedRepoCfg := loadTrustedRepoConfig(ctx, workDir, trustedSHA, run.ID)
 	allowRepoCommands := trustedRepoCfg != nil && trustedRepoCfg.AllowRepoCommands
 	effectiveRepoCfg := config.EffectiveRepoConfig(repoCfg, trustedRepoCfg, allowRepoCommands)
-	cfg := config.Merge(globalCfg, effectiveRepoCfg)
+	cfg := config.MergeWithRepoPolicy(globalCfg, effectiveRepoCfg, globalCfg.RepoPolicyFor(repoPolicyKey(repo)))
 	cfg.TrustedConfigSHA = trustedSHA
 	if globalCfg.Eval.CaptureProvenance {
 		if err := cfg.EnableEvalProvenance(globalCfg, effectiveRepoCfg); err != nil {
@@ -240,6 +240,17 @@ func (m *RunManager) loadRecoveredConfig(ctx context.Context, run *db.Run, repo 
 		}
 	}
 	return cfg, nil
+}
+
+// repoPolicyKey is the name an operator floor is looked up by. Only connected
+// repositories are declared in configuration, so a local repository yields an
+// empty key and therefore the zero policy - which is what keeps the local path
+// byte-identical to its pre-floor behaviour.
+func repoPolicyKey(repo *db.Repo) string {
+	if repo == nil || !repo.Connected() {
+		return ""
+	}
+	return repo.SourceName
 }
 
 func newPipelineAgent(ctx context.Context, cfg *config.Config, lookPath func(string) (string, error)) (agent.Agent, error) {
@@ -875,7 +886,7 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		// This is not an error: it is the secure default in action.
 		slog.Info("repo commands/agent loaded from default branch, not pushed branch", "run_id", run.ID, "branch", branch, "default_branch", repo.DefaultBranch)
 	}
-	cfg := config.Merge(globalCfg, effectiveRepoCfg)
+	cfg := config.MergeWithRepoPolicy(globalCfg, effectiveRepoCfg, globalCfg.RepoPolicyFor(repoPolicyKey(repo)))
 	cfg.TrustedConfigSHA = trustedSHA
 	if globalCfg.Eval.CaptureProvenance {
 		if err := cfg.EnableEvalProvenance(globalCfg, effectiveRepoCfg); err != nil {
