@@ -438,6 +438,61 @@ Local review-evaluation corpus settings for [`no-mistakes eval`](/no-mistakes/re
 
 These are operator settings for this machine's local disk, so they are global-only: an `eval` block in a repository's `.no-mistakes.yaml` is ignored. Corpus storage stays under `<NM_HOME>/eval` and no-mistakes never uploads it; replay still sends code to the selected agent's configured model provider as described in the [Evaluation toolkit](/no-mistakes/reference/eval/).
 
+### repos
+
+Connected repositories: repositories validated by remote URL, with no local checkout. See [QA Mode](/no-mistakes/concepts/qa/) for the model.
+
+|      |          |
+| ---- | -------- |
+| Type | `object` |
+
+Each key is an operator-chosen name matching `^[a-z0-9][a-z0-9._-]{0,63}$`. The name selects the repository on the command line; it never derives a directory or a repository ID, both of which come from the remote identity.
+
+| Field                                | Type   | Default | Description                                                              |
+| ------------------------------------ | ------ | ------- | ------------------------------------------------------------------------ |
+| `url`                                | `str`  | —       | Required. The remote to validate                                         |
+| `credential_env`                     | `str`  | `""`    | Name of an environment variable holding the token, read at provisioning  |
+| `default_branch`                     | `str`  | `""`    | Overrides discovery of the remote's default branch                       |
+| `commit_name`                        | `str`  | `""`    | Commit identity for runs on this repository                              |
+| `commit_email`                       | `str`  | `""`    | Commit identity for runs on this repository                              |
+| `disable_project_settings`           | `bool` | `false` | Explicitly require project instructions be suppressed                    |
+| `allow_project_instructions`         | `bool` | `false` | Lower the connected default that suppresses project instructions         |
+
+A connected repository suppresses the repository's own `AGENTS.md` / `CLAUDE.md` **by default**: you cannot edit a repository you merely watch, so its instructions are untrusted input to the agent that runs against it. `allow_project_instructions` lowers that default, which you need if your only available agent has no verified suppression knob. It lowers the default only — a repository that sets `disable_project_settings` on its own trusted default branch always keeps it, and naming `disable_project_settings` here re-raises the floor.
+
+Prefer `credential_env` over writing a token into `url`. A token in `url` is redacted before the file's contents are persisted (see below) and before the URL is stored in the database, but keeping it out entirely is better.
+
+`fork_url` is rejected here: fork routing is GitHub-parent plus GitHub-fork only and is out of scope for connected repositories.
+
+### qa
+
+Unattended validation policy for connected repositories. See [QA Mode](/no-mistakes/concepts/qa/).
+
+|      |          |
+| ---- | -------- |
+| Type | `object` |
+
+| Field                  | Type   | Default    | Description                                                          |
+| ---------------------- | ------ | ---------- | -------------------------------------------------------------------- |
+| `qa.enabled`           | `bool` | `false`    | Master switch; nothing unattended runs while this is off             |
+| `qa.poll_interval`     | `dur`  | `15m`      | How often watched refs are re-examined                               |
+| `qa.nightly_at`        | `str`  | `""`       | Optional `HH:MM` local-time daily anchor                             |
+| `qa.max_concurrent`    | `int`  | `2`        | QA runs in flight; must be positive                                  |
+| `qa.max_total_runs`    | `int`  | `4`        | Ceiling counting interactive runs, which are never gated by it       |
+| `qa.queue_depth`       | `int`  | `64`       | Queued QA items before the oldest scheduled one is evicted           |
+| `qa.max_run_duration`  | `dur`  | `6h`       | Watcher-side backstop that cancels an over-running QA run            |
+| `qa.max_reports`       | `int`  | `500`      | Retention target for QA reports, pruned oldest-first                 |
+| `qa.default_mode`      | `str`  | `report`   | Mode a watch inherits; `report` or `comment` only                    |
+| `qa.comment`           | `bool` | `false`    | Global half of the two opt-ins a forge comment requires              |
+
+Every default is inert. With no `qa` block the daemon does nothing unattended, and `qa.comment` off means findings never leave this machine.
+
+`qa.default_mode` may not be `fix-pr`, and neither may any watch's mode: an unattended run never writes code. `fix-pr` stays available through an explicit `no-mistakes qa run --mode fix-pr --yes`, where a person is present.
+
+The concurrency defaults are conservative on purpose. Each run spawns agent CLI subprocesses that routinely hold 1–3 GB, and every database write serializes on a single connection. Raise them against observed numbers rather than by guess.
+
+Like `eval`, `repos` and `qa` are operator settings for this machine: both are global-only, and a `repos` or `qa` block in a repository's `.no-mistakes.yaml` is ignored. That is what stops a repository from registering itself, raising its own concurrency, or switching on forge comments for you.
+
 ## Credentials in this file
 
 Provenance records the configuration a review pass ran under, so with `eval.capture_provenance` on this file's contents are stored in the local database with every review round, and copied into the corpus under `<NM_HOME>/eval` by automatic collection.

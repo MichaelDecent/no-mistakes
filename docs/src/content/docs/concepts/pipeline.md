@@ -92,3 +92,7 @@ See [Configuration](/no-mistakes/guides/configuration/).
 - Adding new steps.
 
 This is intentional. The pipeline is opinionated so that "passed the gate" means the same thing across repos.
+
+Read-only [QA mode](/no-mistakes/concepts/qa/) is not an exception to this. A QA run records all nine step
+results too — the steps it does not run are stored with status `skipped` rather than left out — and no
+configuration can reach a gate run's step set at all.
