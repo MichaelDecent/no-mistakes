@@ -2,6 +2,7 @@ package gate
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -169,5 +170,14 @@ func TestInitStillAcceptsAnOrdinaryCheckout(t *testing.T) {
 	}
 	if repo.Connected() {
 		t.Error("an ordinary checkout registered as connected")
+	}
+}
+
+// removeGate deletes a repository's bare gate so a gate-side write fails while
+// the database stays healthy.
+func removeGate(t *testing.T, bareDir string) {
+	t.Helper()
+	if err := os.RemoveAll(bareDir); err != nil {
+		t.Fatal(err)
 	}
 }

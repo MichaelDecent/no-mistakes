@@ -254,3 +254,89 @@ func dirExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
 }
+
+// RefreshConnectedRepoURLs points a connected repository at a new URL for the
+// same repository - a rotated credential, or a switch between https and ssh.
+//
+// It is the connected counterpart of RefreshRepoURLs, which refuses connected
+// repositories outright. The authority here is the operator's configuration,
+// not anything discovered on disk.
+//
+// # Invariant C1
+//
+//	safeurl.Redact(<gate origin>) == repos.upstream_url
+//
+// C1 is what keeps credential recovery working at run time: resolveUpstreamURL
+// accepts the worktree's origin only when its redaction matches the stored row,
+// because the stored row is redacted and cannot supply the credential itself.
+//
+// # Write order
+//
+// The redacted row is written FIRST, then the gate remote, and a failed remote
+// write rolls the row back. The reverse order leaves a window in which the gate
+// already points at the new repository while the row still names the old one,
+// and a fallback resolving the old URL could push this run's branch to the
+// PREVIOUS repository. Rolling back on failure keeps C1 true in both directions
+// rather than leaving a half-applied rotation.
+func RefreshConnectedRepoURLs(ctx context.Context, d *db.DB, p *paths.Paths, repo *db.Repo, url string) (*db.Repo, bool, error) {
+	if d == nil || p == nil || repo == nil || !repo.Connected() {
+		return nil, false, refreshFailure(RefreshConfigMismatch)
+	}
+	identity, err := RemoteIdentity(url)
+	if err != nil {
+		return nil, false, refreshFailure(RefreshInvalidRemote)
+	}
+	// Repointing at a DIFFERENT repository is not a refresh: it would silently
+	// move a registration's history onto another project. Reconciliation
+	// registers the new identity as its own entry instead.
+	if identity != repo.SourceIdentity {
+		return nil, false, refreshFailure(RefreshConfigMismatch)
+	}
+
+	redacted := safeurl.Redact(url)
+	if redacted == repo.UpstreamURL {
+		// Still verify the gate agrees before reporting no-op: the row matching
+		// is not evidence that C1 holds.
+		if err := AssertConnectedGateURLBinding(ctx, p, repo); err == nil {
+			return repo, false, nil
+		}
+	}
+
+	previous := repo.UpstreamURL
+	updated, err := d.ReplaceRepoURLs(repo.ID, redacted, "")
+	if err != nil {
+		return nil, false, refreshFailure(RefreshDatabaseWrite)
+	}
+	if _, err := git.RunBare(ctx, p.RepoDir(repo.ID), "config", "remote.origin.url", url); err != nil {
+		// Roll the row back so it names what the gate still points at.
+		if _, rollbackErr := d.ReplaceRepoURLs(repo.ID, previous, ""); rollbackErr != nil {
+			return nil, false, refreshFailure(RefreshDatabaseWrite)
+		}
+		return nil, false, refreshFailure(RefreshGateWrite)
+	}
+	return updated, true, nil
+}
+
+// AssertConnectedGateURLBinding verifies invariant C1 for one connected
+// repository immediately before a run uses its gate.
+//
+// The connected path fails the run on a mismatch, deliberately unlike the local
+// path, which logs "refresh skipped; continuing". For a local repository the
+// fallback is the operator's own row about their own clone. For a connected
+// repository a stale row may name a DIFFERENT repository, and continuing could
+// push someone's branch to it.
+//
+// Errors are URL-free: a connected repository's URL routinely carries a token.
+func AssertConnectedGateURLBinding(ctx context.Context, p *paths.Paths, repo *db.Repo) error {
+	if p == nil || repo == nil || !repo.Connected() {
+		return nil
+	}
+	origin, err := git.RunBare(ctx, p.RepoDir(repo.ID), "config", "--get", "remote.origin.url")
+	if err != nil {
+		return fmt.Errorf("connected repository %q: gate origin is unreadable", repo.SourceName)
+	}
+	if safeurl.Redact(strings.TrimSpace(origin)) != strings.TrimSpace(repo.UpstreamURL) {
+		return fmt.Errorf("connected repository %q: the gate's origin does not match its registration; refusing to run", repo.SourceName)
+	}
+	return nil
+}
