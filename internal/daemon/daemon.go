@@ -18,6 +18,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/gate"
 	"github.com/kunchenguid/no-mistakes/internal/gatecontext"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
@@ -363,6 +364,15 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager) {
 	orphanStarted := time.Now()
 	reapOrphanedServers(p)
 	logStartupPhase("orphan_servers", orphanStarted)
+
+	// Reconcile the operator's declared inventory BEFORE gate migration, so a
+	// newly declared repository's gate exists by the time migration walks every
+	// directory under ReposDir and stamps its config version. Best effort: a
+	// reconcile failure must never stop the daemon from serving the gates it
+	// already has.
+	reconcileStarted := time.Now()
+	reconcileConnectedOnStartup(context.Background(), d, p)
+	logStartupPhase("connected_reconcile", reconcileStarted)
 
 	gateStarted := time.Now()
 	gateStats := migrateGateConfigs(context.Background(), d, p)
@@ -965,4 +975,55 @@ func stepToInfo(d *db.DB, s *db.StepResult) ipc.StepResultInfo {
 		info.PendingFixSource = rounds.PendingFixSource
 	}
 	return info
+}
+
+// reconcileConnectedOnStartup brings connected-repository registrations in line
+// with config.yaml as the daemon comes up, so an operator who edits the file and
+// restarts does not also have to remember `no-mistakes repos reconcile`.
+//
+// Every failure is logged and swallowed. A malformed entry, an unreachable
+// remote, or an unreadable config must never stop the daemon from serving the
+// gates it already has - a local developer's push does not depend on any of it.
+func reconcileConnectedOnStartup(ctx context.Context, d *db.DB, p *paths.Paths) {
+	globalCfg, err := config.LoadGlobal(p.ConfigFile())
+	if err != nil {
+		slog.Warn("connected reconcile skipped: global config unreadable", "error", err)
+		return
+	}
+	if len(globalCfg.Repos) == 0 {
+		// Still run it: an emptied `repos:` block is how an operator detaches
+		// everything, and detaching keeps records rather than deleting them.
+		if !hasConnectedRepos(d) {
+			return
+		}
+	}
+	result, err := gate.ReconcileConnected(ctx, d, p, globalCfg.Repos)
+	if err != nil {
+		slog.Warn("connected reconcile failed", "error", err)
+		return
+	}
+	for name, failure := range result.Failed {
+		slog.Warn("connected repository not reconciled", "repo", name, "error", failure)
+	}
+	if len(result.Registered)+len(result.Refreshed)+len(result.Detached) > 0 {
+		slog.Info("connected repositories reconciled",
+			"registered", len(result.Registered),
+			"refreshed", len(result.Refreshed),
+			"detached", len(result.Detached),
+			"failed", len(result.Failed),
+		)
+	}
+}
+
+func hasConnectedRepos(d *db.DB) bool {
+	repos, err := d.GetRepos()
+	if err != nil {
+		return false
+	}
+	for _, repo := range repos {
+		if repo.Connected() {
+			return true
+		}
+	}
+	return false
 }

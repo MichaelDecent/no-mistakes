@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
@@ -339,4 +341,139 @@ func AssertConnectedGateURLBinding(ctx context.Context, p *paths.Paths, repo *db
 		return fmt.Errorf("connected repository %q: the gate's origin does not match its registration; refusing to run", repo.SourceName)
 	}
 	return nil
+}
+
+// ReconcileResult reports what one reconciliation pass did. Counts rather than
+// URLs, so it is safe to log.
+type ReconcileResult struct {
+	Registered []string
+	Refreshed  []string
+	Detached   []string
+	Failed     map[string]error
+}
+
+// ReconcileConnected brings the registry in line with the operator's declared
+// inventory.
+//
+// It is STRICTLY ADDITIVE. An entry that disappears from configuration is
+// marked detached, never deleted: reconciliation must not destroy a gate or run
+// history because someone edited or commented out a line. Re-adding the URL
+// clears the marker and reuses the same identity-derived ID, so the gate and the
+// full run history survive - the concrete payoff of deriving IDs from identity
+// rather than from a name. Deletion is only ever the explicit
+// `no-mistakes repos remove`.
+//
+// Local repositories are never read for detachment and never written. Only rows
+// with source_kind='connected' are considered.
+//
+// One entry failing never stops the others: an operator with five repositories
+// and one typo still gets the other four reconciled, with the failure reported.
+func ReconcileConnected(ctx context.Context, d *db.DB, p *paths.Paths, specs map[string]config.RepoSpec) (ReconcileResult, error) {
+	result := ReconcileResult{Failed: map[string]error{}}
+	if d == nil || p == nil {
+		return result, fmt.Errorf("reconcile connected repositories: missing database or paths")
+	}
+
+	// Two configuration entries naming one repository would fight over the same
+	// gate and run history on every pass. Only a caller holding the WHOLE spec
+	// set can see this, which is why the check lives here rather than in
+	// EnsureConnected, where a second name is indistinguishable from a rename.
+	byIdentity := map[string]string{}
+	declared := map[string]bool{}
+	for _, name := range sortedSpecNames(specs) {
+		spec := specs[name]
+		identity, err := RemoteIdentity(spec.URL)
+		if err != nil {
+			result.Failed[name] = fmt.Errorf("resolve remote identity: %w", err)
+			continue
+		}
+		if first, clash := byIdentity[identity]; clash {
+			result.Failed[name] = fmt.Errorf("names the same repository as %q; give one entry per repository", first)
+			continue
+		}
+		byIdentity[identity] = name
+		declared[identity] = true
+
+		existing, err := d.GetRepoBySourceIdentity(identity)
+		if err != nil {
+			result.Failed[name] = fmt.Errorf("check existing registration: %w", err)
+			continue
+		}
+		repo, err := EnsureConnected(ctx, d, p, spec)
+		if err != nil {
+			result.Failed[name] = err
+			continue
+		}
+		if existing == nil {
+			result.Registered = append(result.Registered, repo.SourceName)
+		} else {
+			result.Refreshed = append(result.Refreshed, repo.SourceName)
+		}
+	}
+
+	repos, err := d.GetRepos()
+	if err != nil {
+		return result, fmt.Errorf("list repositories: %w", err)
+	}
+	now := time.Now().Unix()
+	for _, repo := range repos {
+		if !repo.Connected() || declared[repo.SourceIdentity] || repo.DetachedAt != nil {
+			continue
+		}
+		if err := d.SetRepoDetachedAt(repo.ID, &now); err != nil {
+			result.Failed[repo.SourceName] = fmt.Errorf("mark detached: %w", err)
+			continue
+		}
+		result.Detached = append(result.Detached, repo.SourceName)
+	}
+	return result, nil
+}
+
+// RemoveConnected deletes a connected repository's registration, and with
+// --delete-history its gate, worktrees, and identity stub as well.
+//
+// This is the only path that destroys anything, which is why reconciliation
+// detaches instead. It refuses while runs are active: those runs hold worktrees
+// carved from the gate this would remove.
+func RemoveConnected(ctx context.Context, d *db.DB, p *paths.Paths, name string, deleteHistory bool) error {
+	repo, err := d.GetRepoBySourceName(strings.TrimSpace(name))
+	if err != nil {
+		return fmt.Errorf("look up %q: %w", name, err)
+	}
+	if repo == nil || !repo.Connected() {
+		return fmt.Errorf("no connected repository named %q", name)
+	}
+	active, err := d.GetActiveRuns()
+	if err != nil {
+		return fmt.Errorf("check active runs: %w", err)
+	}
+	for _, run := range active {
+		if run.RepoID == repo.ID {
+			return fmt.Errorf("%q has active runs; wait for them to finish or cancel them first", name)
+		}
+	}
+	if deleteHistory {
+		if err := os.RemoveAll(p.RepoDir(repo.ID)); err != nil {
+			return fmt.Errorf("remove gate: %w", err)
+		}
+		if err := os.RemoveAll(p.SourceDir(repo.ID)); err != nil {
+			return fmt.Errorf("remove identity stub: %w", err)
+		}
+		if err := os.RemoveAll(filepath.Join(p.WorktreesDir(), repo.ID)); err != nil {
+			return fmt.Errorf("remove worktrees: %w", err)
+		}
+	}
+	if err := d.DeleteRepo(repo.ID); err != nil {
+		return fmt.Errorf("delete registration: %w", err)
+	}
+	return nil
+}
+
+func sortedSpecNames(specs map[string]config.RepoSpec) []string {
+	names := make([]string, 0, len(specs))
+	for name := range specs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

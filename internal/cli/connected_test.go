@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -126,5 +127,50 @@ func mustWriteFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestReposRemoveRequiresYesForDeleteHistory pins that the one irreversible
+// path takes an explicit confirmation, not just a flag. Deleting a gate
+// destroys run history that cannot be recovered.
+func TestReposRemoveRequiresYesForDeleteHistory(t *testing.T) {
+	root := t.TempDir()
+	p := paths.WithRoot(root)
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "aabbccddeeff"
+	if _, err := database.InsertConnectedRepo(
+		id, p.SourceDir(id), "https://example.test/acme/api.git", "example.test/acme/api", "acme-api", "main",
+	); err != nil {
+		t.Fatal(err)
+	}
+	database.Close()
+	t.Setenv("NM_HOME", root)
+
+	cmd := newReposCmd()
+	cmd.SetArgs([]string{"remove", "acme-api", "--delete-history"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err = cmd.Execute()
+	if err == nil {
+		t.Fatal("repos remove --delete-history succeeded without --yes; it must refuse")
+	}
+	if !strings.Contains(err.Error(), "--yes") {
+		t.Errorf("error %q does not tell the operator how to confirm", err)
+	}
+
+	// The record must survive the refusal.
+	reopened, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if still, _ := reopened.GetRepo(id); still == nil {
+		t.Error("the registration was removed despite the refusal")
 	}
 }
