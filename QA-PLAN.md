@@ -4,7 +4,7 @@
 > (`claude/qa-agent-multi-repo-plan-siv96n`). It exists so a new session can pick the work up mid-stream.
 > **Delete it in a final commit before this branch merges.**
 >
-> Specs S1–S13 are complete and pushed. **Start at S14.**
+> Specs S1–S14 are complete and pushed. **Start at S15.**
 
 ---
 
@@ -38,7 +38,7 @@ CREATE/INSERT/SELECT against `modernc.org/sqlite`).
 **The `SourceYAML` credential spill is also fixed** — `65ac9e5`, the second local commit. That was the
 one ship-blocking item, so it deliberately landed on its own rather than inside a larger phase.
 
-**STAGES A, B, AND C ARE COMPLETE — S1–S13 of 23, all pushed to PR #1.**
+**STAGES A, B, AND C ARE COMPLETE, AND STAGE D HAS STARTED — S1–S14 of 23, all pushed to PR #1.**
 
 | Spec | Commit |
 |---|---|
@@ -48,9 +48,20 @@ one ship-blocking item, so it deliberately landed on its own rather than inside 
 | S11 run-start fails closed on gate drift | `f3b45c8` |
 | S12 run slots + self-pruning branch locks | `98f424d` |
 | S13 lifecycle blocking classification | `5d84391` |
+| S14 `applyApprovalAction` seam | `3d28d90` |
 
-**Next: S14** (extract `applyApprovalAction`, a pure refactor), then S15–S18 to reach the first useful
+**Next: S15** (the `GatePolicy` seam and both policies), then S16–S18 to reach the first useful
 milestone: `qa run --mode report` producing a real report.
+
+**What S14 hands S15.** `internal/pipeline/approval_action.go` owns
+`applyApprovalAction(response, run, repo, sr, sctx, approvalActionState) approvalActionResult`, plus the
+`approvalContinuation` values `approvalContinueLoop` / `approvalGateResolved` / `approvalStepFinished`.
+The unattended path in S15 builds an `approvalResponse` from its `GateDecision` and calls that same
+function, so policy-resolved and human-answered gates are the same code by construction. Two details the
+refactor deliberately preserved: an **unrecognized action re-executes the step** (it falls out of the
+switch, exactly as before), and the two pointer fields in `approvalActionState` (`phaseStart`,
+`nextTrigger`) are the only loop state the function writes back — everything else it mutates travels
+through `sctx`.
 
 ### Deviations recorded while implementing Stage B/C
 
@@ -976,10 +987,12 @@ failure (the deliberate asymmetry), carve the worktree from the connected gate.
 
 ### Stage D — one QA run, on demand
 
-**S14 — Extract `applyApprovalAction`** · *pure refactor, no behaviour change*
-Lift the `switch response.action` body (`executor.go:910-963`) into one function. Ships alone precisely so
-the diff that later adds the policy path contains **no** restructuring.
-*Done when:* every existing executor/approval test passes untouched.
+**S14 ✅ Extract `applyApprovalAction`** · *pure refactor, no behaviour change*
+Lifted the `switch response.action` body (was `executor.go:910-963`) into
+`internal/pipeline/approval_action.go`. Shipped alone precisely so the diff that later adds the policy
+path contains **no** restructuring. Every existing executor/approval test passes untouched; the seam's own
+contract (one case per action, plus the preserved unrecognized-action retry) is pinned by
+`executor_approval_action_test.go`.
 
 **S15 — `GatePolicy` seam + both policies** · *depends: S14* `↳`
 `internal/pipeline/gatepolicy.go`, `ReadOnlyGatePolicy`, `ConvergingGatePolicy`, the single insertion
