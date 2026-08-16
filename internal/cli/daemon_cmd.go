@@ -342,15 +342,26 @@ func guardDestructiveDaemonLifecycle(p *paths.Paths, stderr io.Writer, action st
 	if err != nil {
 		return fmt.Errorf("check active pipeline runs: %w", err)
 	}
-	if len(runs) == 0 {
+	// Only runs that would LOSE work block. A read-only QA run never pushed and
+	// never opened a PR, so the next sweep re-derives it; blocking on those would
+	// make `daemon restart` need --force most nights and train operators to
+	// always pass it, defeating the guard for the work it exists to protect.
+	blocking := lifecycle.BlockingRuns(runs)
+	cancellable := lifecycle.CancellableRuns(runs)
+	if len(blocking) == 0 {
+		// Still say what is being discarded rather than dropping it silently.
+		if len(cancellable) > 0 {
+			fmt.Fprint(stderr, lifecycle.CancellableRunList(cancellable))
+		}
 		return nil
 	}
 	if force {
-		fmt.Fprintf(stderr, "FORCE: %s will stop/restart the daemon while %d active pipeline runs are in progress\n", action, len(runs))
-		fmt.Fprint(stderr, lifecycle.RunList(runs))
+		fmt.Fprintf(stderr, "FORCE: %s will stop/restart the daemon while %d active pipeline runs are in progress\n", action, len(blocking))
+		fmt.Fprint(stderr, lifecycle.RunList(blocking))
+		fmt.Fprint(stderr, lifecycle.CancellableRunList(cancellable))
 		return nil
 	}
-	return fmt.Errorf("refusing %s because %d active pipeline runs are in progress; pass --force to stop/restart the daemon anyway\n%s", action, len(runs), lifecycle.RunList(runs))
+	return fmt.Errorf("refusing %s because %d active pipeline runs are in progress; pass --force to stop/restart the daemon anyway\n%s%s", action, len(blocking), lifecycle.RunList(blocking), lifecycle.CancellableRunList(cancellable))
 }
 
 func newDaemonStatusCmd() *cobra.Command {

@@ -16,6 +16,9 @@ func (u *updater) confirmActiveRunsBeforeUpdate() error {
 	if err != nil {
 		return fmt.Errorf("check active pipeline runs: %w", err)
 	}
+	// Read-only QA runs never block an update: they wrote no code, and the next
+	// sweep re-derives them. See lifecycle.BlockingRuns.
+	runs = lifecycle.BlockingRuns(runs)
 	if len(runs) == 0 {
 		return nil
 	}
