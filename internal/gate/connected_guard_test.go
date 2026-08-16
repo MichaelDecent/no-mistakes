@@ -20,6 +20,15 @@ func mustRunGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
+// gitOut runs git and returns stdout, letting a caller distinguish "the command
+// failed" from "the value is empty" - which config --get needs.
+func gitOut(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	return strings.TrimSpace(string(out)), err
+}
+
 // TestEjectRefusesConnectedRepo pins that eject - which exists to remove the
 // gate remote from a developer's clone - refuses a connected repository, and
 // that its gate and record survive.
