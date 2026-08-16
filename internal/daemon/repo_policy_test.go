@@ -1,9 +1,15 @@
 package daemon
 
 import (
+	"context"
+	"strings"
 	"testing"
 
+	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/gate"
+	"github.com/kunchenguid/no-mistakes/internal/git"
+	"github.com/kunchenguid/no-mistakes/internal/paths"
 )
 
 // TestRepoPolicyKeyIsEmptyForLocalRepos pins the property that keeps every
@@ -37,5 +43,55 @@ func TestRepoPolicyKeyIsEmptyForLocalRepos(t *testing.T) {
 				t.Errorf("repoPolicyKey() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestStartRunFailsClosedOnConnectedGateDrift pins the deliberate asymmetry at
+// run start.
+//
+// A local repository whose URL refresh fails logs and continues: the fallback is
+// the operator's own row about their own clone. A connected repository must FAIL
+// the run, because a stale or drifted row may name a different repository and
+// continuing could carve a worktree from a gate pointing somewhere this run was
+// never authorized to touch.
+func TestStartRunFailsClosedOnConnectedGateDrift(t *testing.T) {
+	root := t.TempDir()
+	p := paths.WithRoot(root)
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	repo, err := gate.EnsureConnected(context.Background(), database, p, config.RepoSpec{
+		Name: "acme-api", URL: "https://example.test/acme/api.git",
+		DefaultBranch: "main", CommitName: "QA", CommitEmail: "qa@example.test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := database.GetRepo(repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Healthy binding passes.
+	if err := gate.AssertConnectedGateURLBinding(context.Background(), p, stored); err != nil {
+		t.Fatalf("freshly registered repo failed its binding check: %v", err)
+	}
+
+	// Drift the gate to a different repository; the run must refuse.
+	if _, err := git.RunBare(context.Background(), p.RepoDir(repo.ID), "config", "remote.origin.url", "https://example.test/attacker/evil.git"); err != nil {
+		t.Fatal(err)
+	}
+	err = gate.AssertConnectedGateURLBinding(context.Background(), p, stored)
+	if err == nil {
+		t.Fatal("binding check passed against a drifted gate; startRun would proceed")
+	}
+	if !strings.Contains(err.Error(), "acme-api") {
+		t.Errorf("error %q does not name the repository", err)
 	}
 }

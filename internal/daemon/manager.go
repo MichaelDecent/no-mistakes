@@ -765,12 +765,25 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 	branchMu.Lock()
 	defer branchMu.Unlock()
 
-	// Best-effort only: a clone's remotes may change after init. Refresh the
-	// registered URLs before constructing any run-owned Git operation, but keep
-	// the exact prior repo value and continue when discovery, validation, or the
-	// atomic database replacement fails. The reason is deliberately bounded and
-	// URL-free so neither credentials nor sensitive remote material reach logs.
-	if refreshed, _, refreshErr := gate.RefreshRepoURLs(ctx, m.db, repo); refreshErr != nil {
+	if repo.Connected() {
+		// SECURITY: deliberately NOT best-effort, unlike the local branch below.
+		//
+		// For a local repository the fallback is the operator's own stale row
+		// about their own clone, so continuing is safe. For a connected
+		// repository a stale or drifted row may name a DIFFERENT repository, and
+		// continuing could carve a worktree from a gate pointing somewhere this
+		// run was never authorized to touch. Invariant C1 is verified here,
+		// before any run-owned Git operation, and a mismatch fails the run.
+		if err := gate.AssertConnectedGateURLBinding(ctx, m.paths, repo); err != nil {
+			trackStartFailure("connected_binding")
+			return "", err
+		}
+	} else if refreshed, _, refreshErr := gate.RefreshRepoURLs(ctx, m.db, repo); refreshErr != nil {
+		// Best-effort only: a clone's remotes may change after init. Refresh the
+		// registered URLs before constructing any run-owned Git operation, but keep
+		// the exact prior repo value and continue when discovery, validation, or the
+		// atomic database replacement fails. The reason is deliberately bounded and
+		// URL-free so neither credentials nor sensitive remote material reach logs.
 		slog.Warn("repository URL refresh skipped; continuing with existing registration", "repo_id", repo.ID, "reason", gate.ReasonForRefreshFailure(refreshErr))
 	} else {
 		repo = refreshed
