@@ -62,11 +62,16 @@ type Run struct {
 	IntentSource    *string
 	IntentSessionID *string
 	IntentScore     *float64
-	CreatedAt       int64
-	UpdatedAt       int64
+	// RunKind and RunMode are nullable: every row written before QA existed reads
+	// back empty, which types.NormalizeRunKind/NormalizeRunMode resolve to the
+	// author gate in fix-pr mode - exactly what those rows were.
+	RunKind   string
+	RunMode   string
+	CreatedAt int64
+	UpdatedAt int64
 }
 
-const runColumns = `id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, created_at, updated_at`
+const runColumns = `id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, COALESCE(run_kind, ''), COALESCE(run_mode, ''), created_at, updated_at`
 
 func scanRun(row interface {
 	Scan(...any) error
@@ -78,6 +83,7 @@ func scanRun(row interface {
 		&r.LastPushedAt, &r.PushGeneration, &r.PushActive, &r.TerminalHeadVerifiedAt,
 		&r.CustodyReturnedAt, &r.Error, &r.AwaitingAgentSince, &r.ParkedMS,
 		&r.Intent, &r.IntentSource, &r.IntentSessionID, &r.IntentScore,
+		&r.RunKind, &r.RunMode,
 		&r.CreatedAt, &r.UpdatedAt,
 	)
 }

@@ -47,7 +47,14 @@ type RunManager struct {
 	paths        *paths.Paths
 	steps        StepFactory
 
-	branchLocks sync.Map // repoID+"/"+branch → *sync.Mutex
+	// branchLocks serializes run starts per repository+branch. It is refcounted
+	// and self-pruning: a bare sync.Map never removed a key, which a QA sweep over
+	// many repositories times many refs would grow without ceiling.
+	branchLocks *branchLockSet
+
+	// slots bounds concurrent work. Interactive runs are counted but never gated;
+	// QA runs are capped and yield. See runSlots.
+	slots *runSlots
 
 	// evalCaptureMu serializes automatic eval collection. Concurrent runs
 	// finishing together would otherwise write the same per-repository object
@@ -88,6 +95,10 @@ func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *Ru
 		subscribers:   make(map[string][]*eventMailbox),
 		stateRevs:     make(map[string]int64),
 		completedRuns: make(map[string]bool),
+		branchLocks:   newBranchLockSet(),
+		// Defaults until the operator's qa block is applied. A manager that never
+		// serves QA work still needs a non-nil slots to count interactive runs.
+		slots: newRunSlots(2, 4),
 	}
 }
 
@@ -760,10 +771,8 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 	// Serialize per repo+branch to prevent two concurrent pushes from both
 	// passing cancelActiveRuns and creating duplicate pipelines.
 	lockKey := repo.ID + "/" + branch
-	lockVal, _ := m.branchLocks.LoadOrStore(lockKey, &sync.Mutex{})
-	branchMu := lockVal.(*sync.Mutex)
-	branchMu.Lock()
-	defer branchMu.Unlock()
+	releaseBranch := m.branchLocks.Acquire(lockKey)
+	defer releaseBranch()
 
 	if repo.Connected() {
 		// SECURITY: deliberately NOT best-effort, unlike the local branch below.
