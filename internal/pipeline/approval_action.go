@@ -27,6 +27,25 @@ const (
 	approvalStepFinished
 )
 
+// approvalSource is who answered a gate. It never changes what an action does -
+// that is the whole point of one owner - only how the answer is attributed in
+// the round's provenance and in telemetry, so an unattended run's own decisions
+// never read back as a person's.
+type approvalSource string
+
+const (
+	approvalSourceUser   approvalSource = "user"
+	approvalSourcePolicy approvalSource = "policy"
+)
+
+// selectionSource maps an answer's author to the round selection vocabulary.
+func (s approvalSource) selectionSource() string {
+	if s == approvalSourcePolicy {
+		return db.RoundSelectionSourcePolicy
+	}
+	return db.RoundSelectionSourceUser
+}
+
 // approvalActionState is the executeStep loop state that applying an approval
 // action reads. The two pointer fields are the only state it writes back into
 // the loop; sctx carries the rest.
@@ -38,7 +57,10 @@ type approvalActionState struct {
 	finalExitCode  int
 	logPath        string
 	currentRoundID string
-	writeLog       func(string)
+	// actionSource attributes the answer. An empty value is the human path, so
+	// a caller that forgets it is attributed exactly as before this existed.
+	actionSource approvalSource
+	writeLog     func(string)
 
 	// phaseStart restarts the execution clock when the gate resolves, so the
 	// approval wait is never billed as step execution time.
@@ -99,11 +121,15 @@ func (e *Executor) applyApprovalAction(
 		}
 
 	case types.ActionFix:
-		telemetry.Track("fix", e.fixTelemetryFields("user", state.stepName, selectedFindingCount(state.findings, response.findingIDs), 0))
+		source := state.actionSource
+		if source == "" {
+			source = approvalSourceUser
+		}
+		telemetry.Track("fix", e.fixTelemetryFields(string(source), state.stepName, selectedFindingCount(state.findings, response.findingIDs), 0))
 		// Fix - mark step as fixing, resume execution timer, re-execute.
 		*state.phaseStart = time.Now()
 		selectedCount := selectedFindingCount(state.findings, response.findingIDs)
-		state.writeLog(fmt.Sprintf("user-fix round starting after round %d (%d %s selected)", state.roundNum, selectedCount, pluralize(selectedCount, "finding", "findings")))
+		state.writeLog(fmt.Sprintf("%s-fix round starting after round %d (%d %s selected)", source, state.roundNum, selectedCount, pluralize(selectedCount, "finding", "findings")))
 		if dbErr := e.db.UpdateStepStatus(sr.ID, types.StepStatusFixing); dbErr != nil {
 			slog.Warn("failed to update step status in db", "step", state.stepName, "status", "fixing", "error", dbErr)
 		}
@@ -115,7 +141,7 @@ func (e *Executor) applyApprovalAction(
 		if state.currentRoundID != "" {
 			allSelectedIDs := combineSelectedFindingIDs(response.findingIDs, mergedFindings)
 			if idsJSON := marshalFindingIDs(allSelectedIDs); idsJSON != "" {
-				if dbErr := e.db.SetStepRoundSelection(state.currentRoundID, &idsJSON, db.RoundSelectionSourceUser); dbErr != nil {
+				if dbErr := e.db.SetStepRoundSelection(state.currentRoundID, &idsJSON, source.selectionSource()); dbErr != nil {
 					slog.Warn("failed to record selected finding ids", "step", state.stepName, "round", state.roundNum, "error", dbErr)
 				}
 			}

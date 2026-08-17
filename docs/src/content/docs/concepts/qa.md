@@ -60,6 +60,24 @@ against a stale base would re-report issues that are already fixed.
 One consequence to know: because `document` is skipped, a `report` or `comment` run produces no
 documentation findings.
 
+## Nobody is there to answer a gate
+
+Several steps park for a decision when they find something: review, test, and lint hold the run at an
+approval gate. In the gate scope that is the whole point — you pushed, so you are there to decide. An
+unattended QA run has nobody to ask, so its gates are answered by the run's own **mode**, never left
+waiting:
+
+- `report` and `comment` **approve** every gate. Findings are not lost by approving: they stay recorded on
+  the step and its round, and the verdict is derived from those records, not from the step's status.
+  Approving is also why these runs never show as parked — nothing waits, so nothing stalls.
+- `fix-pr` fixes each finding **once** and then approves. Fixing forever is the alternative, and a finding
+  that no fix can clear would cycle review → fix → re-review indefinitely.
+
+Two properties hold regardless of mode. A gate run **never** has its gates answered this way — it always
+parks for the person who pushed. And the CI gate is never answered this way either, in any mode: CI resolves
+itself from the forge's own checks, and answering it early would throw away the mechanism that makes
+unattended CI monitoring work at all.
+
 ## Verdict is about the code; status is about the run
 
 These are two different questions with two different owners, and conflating them is how a repository with

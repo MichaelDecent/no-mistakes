@@ -23,6 +23,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps"
 	"github.com/kunchenguid/no-mistakes/internal/procreap"
+	"github.com/kunchenguid/no-mistakes/internal/qa"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -100,6 +101,22 @@ func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *Ru
 		// serves QA work still needs a non-nil slots to count interactive runs.
 		slots: newRunSlots(2, 4),
 	}
+}
+
+// gatePolicyForRun is the one place a run's stored kind and mode become a gate
+// policy, used by both the start path and crash recovery so a resumed run cannot
+// be answered differently from how it started.
+//
+// Reading through the normalizers is deliberate: they are the single owner of
+// what a stored value means, so this function cannot develop its own opinion
+// about a NULL or unrecognized column. Every run the push path creates is a gate
+// run, so this returns nil there and the author-side gate keeps blocking for the
+// person who pushed.
+func gatePolicyForRun(run *db.Run) pipeline.GatePolicy {
+	if run == nil {
+		return nil
+	}
+	return qa.PolicyFor(types.NormalizeRunKind(run.RunKind), types.NormalizeRunMode(run.RunMode))
 }
 
 type recoveredRunPlan struct {
@@ -335,6 +352,10 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 	}
 	runCtx, cancel := context.WithCancelCause(context.Background())
 	executor := pipeline.NewExecutor(m.db, m.paths, plan.cfg, plan.agent, plan.steps, m.broadcast)
+	// A resumed run must be answered the same way it was before the crash, so
+	// the policy is reinstalled from the run's own stored kind and mode rather
+	// than inferred from anything about the recovery path.
+	executor.SetGatePolicy(gatePolicyForRun(plan.run))
 	done := make(chan struct{})
 	m.mu.Lock()
 	m.executors[plan.run.ID] = executor
@@ -977,6 +998,7 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 	runCtx, cancel := context.WithCancelCause(context.Background())
 	executor := pipeline.NewExecutor(m.db, m.paths, cfg, ag, execSteps, m.broadcast)
 	executor.SetSkippedSteps(skipSteps)
+	executor.SetGatePolicy(gatePolicyForRun(run))
 
 	// Track executor.
 	done := make(chan struct{})

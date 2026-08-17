@@ -1,11 +1,35 @@
 package db
 
-import "fmt"
+import (
+	"fmt"
+	"unicode/utf8"
+)
 
 const (
 	RoundSelectionSourceUser    = "user"
 	RoundSelectionSourceAutoFix = "auto_fix"
+	// RoundSelectionSourcePolicy is a selection made by an unattended gate
+	// policy answering for a run that has no human and no driving agent.
+	// Keeping it distinct from "user" is what stops a QA run's own decisions
+	// from reading back as a person's.
+	RoundSelectionSourcePolicy = "policy"
 )
+
+// Gate-action sources. gate_action records how a parked approval gate was
+// answered, and gate_action_source records who answered it. Only the policy
+// source is written today; the others name the vocabulary the column carries so
+// a later writer does not invent a second spelling for the same answer.
+const (
+	GateActionSourceHuman      = "human"
+	GateActionSourcePolicy     = "policy"
+	GateActionSourceReconciler = "reconciler"
+	GateActionSourceAutoFix    = "auto-fix"
+)
+
+// maxGateActionReason bounds the stored reason. A reason is a short explanation
+// for a status surface, never a payload: bounding it at the persistence boundary
+// keeps every future caller bounded rather than trusting each one.
+const maxGateActionReason = 256
 
 // StepRound represents one execution round within a pipeline step.
 type StepRound struct {
@@ -36,8 +60,14 @@ type StepRound struct {
 	// the fix attempt performed during this round. It is only set when the
 	// round itself was a fix round (trigger=="auto_fix").
 	FixSummary *string
-	DurationMS int64
-	CreatedAt  int64
+	// GateAction, GateActionSource, and GateActionReason record how this
+	// round's approval gate was answered, by whom, and why. All three are nil
+	// for a round that never parked at a gate.
+	GateAction       *string
+	GateActionSource *string
+	GateActionReason *string
+	DurationMS       int64
+	CreatedAt        int64
 }
 
 // StepRoundStats summarizes execution rounds for a step. It lets status
@@ -209,10 +239,51 @@ func (d *DB) SetStepRoundUserFindings(id string, userFindingsJSON *string) error
 	return nil
 }
 
+// SetStepRoundGateAction records how the round's approval gate was answered:
+// the action, who answered it (one of the GateActionSource constants), and a
+// short reason. It is advisory provenance for status and report surfaces - the
+// action itself is applied by the executor, not read back from here - so a
+// write failure must never be treated as a reason to abandon the gate.
+//
+// An empty action clears all three columns, which keeps the column set
+// consistent rather than leaving a source with no action beside it.
+func (d *DB) SetStepRoundGateAction(id, action, source, reason string) error {
+	var actionPtr, sourcePtr, reasonPtr *string
+	if action != "" {
+		actionPtr = &action
+		if source != "" {
+			sourcePtr = &source
+		}
+		if reason != "" {
+			bounded := truncateGateActionReason(reason)
+			reasonPtr = &bounded
+		}
+	}
+	if _, err := d.sql.Exec(
+		`UPDATE step_rounds SET gate_action = ?, gate_action_source = ?, gate_action_reason = ? WHERE id = ?`,
+		actionPtr, sourcePtr, reasonPtr, id,
+	); err != nil {
+		return fmt.Errorf("set step round gate action: %w", err)
+	}
+	return nil
+}
+
+func truncateGateActionReason(reason string) string {
+	if len(reason) <= maxGateActionReason {
+		return reason
+	}
+	// Cut on a rune boundary so the stored reason stays valid UTF-8.
+	cut := maxGateActionReason
+	for cut > 0 && !utf8.RuneStart(reason[cut]) {
+		cut--
+	}
+	return reason[:cut] + "..."
+}
+
 // GetRoundsByStep returns all rounds for a step result, ordered by round number.
 func (d *DB) GetRoundsByStep(stepResultID string) ([]*StepRound, error) {
 	rows, err := d.sql.Query(
-		`SELECT id, step_result_id, round, trigger_type, findings_json, reviewed_head_sha, starting_head_sha, trusted_config_sha, global_config_yaml, repo_config_yaml, user_findings_json, selected_finding_ids, selection_source, fix_summary, duration_ms, created_at FROM step_rounds WHERE step_result_id = ? ORDER BY round`,
+		`SELECT id, step_result_id, round, trigger_type, findings_json, reviewed_head_sha, starting_head_sha, trusted_config_sha, global_config_yaml, repo_config_yaml, user_findings_json, selected_finding_ids, selection_source, fix_summary, gate_action, gate_action_source, gate_action_reason, duration_ms, created_at FROM step_rounds WHERE step_result_id = ? ORDER BY round`,
 		stepResultID,
 	)
 	if err != nil {
@@ -222,7 +293,7 @@ func (d *DB) GetRoundsByStep(stepResultID string) ([]*StepRound, error) {
 	var rounds []*StepRound
 	for rows.Next() {
 		r := &StepRound{}
-		if err := rows.Scan(&r.ID, &r.StepResultID, &r.Round, &r.Trigger, &r.FindingsJSON, &r.ReviewedHeadSHA, &r.StartingHeadSHA, &r.TrustedConfigSHA, &r.GlobalConfigYAML, &r.RepoConfigYAML, &r.UserFindingsJSON, &r.SelectedFindingIDs, &r.SelectionSource, &r.FixSummary, &r.DurationMS, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.StepResultID, &r.Round, &r.Trigger, &r.FindingsJSON, &r.ReviewedHeadSHA, &r.StartingHeadSHA, &r.TrustedConfigSHA, &r.GlobalConfigYAML, &r.RepoConfigYAML, &r.UserFindingsJSON, &r.SelectedFindingIDs, &r.SelectionSource, &r.FixSummary, &r.GateAction, &r.GateActionSource, &r.GateActionReason, &r.DurationMS, &r.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan step round: %w", err)
 		}
 		rounds = append(rounds, r)

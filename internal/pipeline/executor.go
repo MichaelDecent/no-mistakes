@@ -64,6 +64,11 @@ type Executor struct {
 
 	gateReconcileInterval time.Duration
 	gateReconcileTimeout  time.Duration
+
+	// gatePolicy answers approval gates for a run with no human and no driving
+	// agent. Nil for every author-side gate run, which is what keeps the gate's
+	// blocking behaviour untouched. See gatepolicy.go.
+	gatePolicy GatePolicy
 }
 
 // SetSkippedSteps configures steps that should be marked skipped without running.
@@ -326,22 +331,48 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		slog.Warn("could not reconcile recovered approval gate; preserving it", "run_id", run.ID, "step", gate.step.Name(), "error", reconcileErr)
 	}
 
-	e.mu.Lock()
-	e.waiting = true
-	e.waitingStep = gate.step.Name()
-	e.mu.Unlock()
-	e.emitStepEventWithFindingsAndError(
-		ipc.EventStepCompleted,
-		run,
-		repo,
-		gate.step.Name(),
-		string(gate.stepResult.Status),
-		gate.findings,
-		"",
-		gate.stepResult.DurationMS,
-	)
+	// A recovered gate is answered by the run's policy before it is republished
+	// as parked, for the same reason as the live path: an unattended run has no
+	// one to wait for. Unreachable today, because the only QA mode that can be
+	// found parked is fix-pr at the CI gate and a reconcilable gate is never
+	// policy-answered - but correct by construction rather than by coincidence.
+	var response approvalResponse
+	reconciled := false
+	policyAnswered := false
+	if policyResponse, resolved := e.resolveGateByPolicy(ctx, gate.step, GateRequest{
+		Step:            gate.step.Name(),
+		Findings:        gateFindings(gate.findings),
+		FindingsJSON:    gate.findings,
+		Fixing:          gate.stepResult.Status == types.StepStatusFixReview,
+		AutoFixAttempts: gate.autoFixes,
+		Round:           gate.round,
+		Recovered:       true,
+	}, gate.lastRoundID, nil); resolved {
+		response = policyResponse
+		policyAnswered = true
+	} else {
+		e.mu.Lock()
+		e.waiting = true
+		e.waitingStep = gate.step.Name()
+		e.mu.Unlock()
+		e.emitStepEventWithFindingsAndError(
+			ipc.EventStepCompleted,
+			run,
+			repo,
+			gate.step.Name(),
+			string(gate.stepResult.Status),
+			gate.findings,
+			"",
+			gate.stepResult.DurationMS,
+		)
 
-	response, reconciled, err := e.waitForApprovalOrReconcile(ctx, gate.step, reconcileCtx, false)
+		var waitErr error
+		response, reconciled, waitErr = e.waitForApprovalOrReconcile(ctx, gate.step, reconcileCtx, false)
+		err = waitErr
+	}
+	// The run inherited a park marker from before the crash either way, so
+	// recovery always clears it - a policy-answered gate must not leave the run
+	// reading as still waiting for an agent.
 	if dbErr := e.db.CompleteRunAwaitingAgent(run.ID, time.Since(parkStart).Milliseconds()); dbErr != nil {
 		slog.Warn("failed to complete awaiting-agent state in db", "step", gate.step.Name(), "run", run.ID, "error", dbErr)
 	}
@@ -356,18 +387,27 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		return completeReconciledGate()
 	}
 
-	approvalFields := telemetry.Fields{
-		"step":       string(gate.step.Name()),
-		"action":     string(response.action),
-		"fix_review": gate.stepResult.Status == types.StepStatusFixReview,
+	// An approval event describes a person (or a driving agent) answering a
+	// gate. A policy decision is neither, and the live path does not emit one
+	// either, so recovery must not invent one here.
+	if !policyAnswered {
+		approvalFields := telemetry.Fields{
+			"step":       string(gate.step.Name()),
+			"action":     string(response.action),
+			"fix_review": gate.stepResult.Status == types.StepStatusFixReview,
+		}
+		if agentName := e.telemetryAgentName(); agentName != "" {
+			approvalFields["agent"] = agentName
+		}
+		if selectedCount := selectedFindingCount(gate.findings, response.findingIDs); selectedCount > 0 {
+			approvalFields["selected_findings_count"] = selectedCount
+		}
+		telemetry.Track("approval", approvalFields)
 	}
-	if agentName := e.telemetryAgentName(); agentName != "" {
-		approvalFields["agent"] = agentName
+	recoveredActionSource := approvalSourceUser
+	if policyAnswered {
+		recoveredActionSource = approvalSourcePolicy
 	}
-	if selectedCount := selectedFindingCount(gate.findings, response.findingIDs); selectedCount > 0 {
-		approvalFields["selected_findings_count"] = selectedCount
-	}
-	telemetry.Track("approval", approvalFields)
 	switch response.action {
 	case types.ActionApprove:
 		if err := completeRecoveredGate(); err != nil {
@@ -388,13 +428,13 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusFailed), "", "aborted by user", &duration)
 		return e.failRun(run, repo, fmt.Errorf("step %s: aborted by user", gate.step.Name()), ctx)
 	case types.ActionFix:
-		telemetry.Track("fix", e.fixTelemetryFields("user", gate.step.Name(), selectedFindingCount(gate.findings, response.findingIDs), 0))
+		telemetry.Track("fix", e.fixTelemetryFields(string(recoveredActionSource), gate.step.Name(), selectedFindingCount(gate.findings, response.findingIDs), 0))
 		selected := filterFindingsJSON(gate.findings, response.findingIDs)
 		merged := mergeUserOverridesJSON(selected, response.instructions, response.addedFindings)
 		if gate.lastRoundID != "" {
 			allSelectedIDs := combineSelectedFindingIDs(response.findingIDs, merged)
 			if idsJSON := marshalFindingIDs(allSelectedIDs); idsJSON != "" {
-				if dbErr := e.db.SetStepRoundSelection(gate.lastRoundID, &idsJSON, db.RoundSelectionSourceUser); dbErr != nil {
+				if dbErr := e.db.SetStepRoundSelection(gate.lastRoundID, &idsJSON, recoveredActionSource.selectionSource()); dbErr != nil {
 					slog.Warn("failed to record recovered selected finding ids", "step", gate.step.Name(), "round", gate.round, "error", dbErr)
 				}
 			}
@@ -841,6 +881,47 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		// Freeze execution timer before entering approval wait.
 		executionMS += time.Since(phaseStart).Milliseconds()
 
+		// Unattended resolution happens here: after the timer freeze, which is
+		// local arithmetic nothing can observe, and before every park side
+		// effect - before ParkStepForApproval writes awaiting_agent_since,
+		// before e.waiting is set, and before the approval wait is entered. A
+		// policy-answered gate is therefore never observable as parked, can
+		// never be answered over IPC, is never seen by recoverableParkedRuns,
+		// and can never race claimGateReconciliation.
+		//
+		// The freeze must precede it: applyApprovalAction restarts the phase
+		// clock, so resolving before the freeze would discard the round's own
+		// execution time and report every unattended step as instant.
+		if policyResponse, resolved := e.resolveGateByPolicy(ctx, step, GateRequest{
+			Step:            stepName,
+			Findings:        gateFindings(outcome.Findings),
+			FindingsJSON:    outcome.Findings,
+			Fixing:          sctx.Fixing,
+			AutoFixAttempts: autoFixAttempts,
+			Round:           roundNum,
+		}, currentRoundID, writeLog); resolved {
+			applied := e.applyApprovalAction(policyResponse, run, repo, sr, sctx, approvalActionState{
+				stepName:       stepName,
+				findings:       outcome.Findings,
+				roundNum:       roundNum,
+				executionMS:    executionMS,
+				finalExitCode:  finalExitCode,
+				logPath:        logPath,
+				currentRoundID: currentRoundID,
+				actionSource:   approvalSourcePolicy,
+				writeLog:       writeLog,
+				phaseStart:     &phaseStart,
+				nextTrigger:    &nextTrigger,
+			})
+			switch applied.continuation {
+			case approvalGateResolved:
+				goto done
+			case approvalStepFinished:
+				return applied.skipRemaining, applied.err
+			}
+			continue
+		}
+
 		// Determine approval status: fix_review after a fix cycle, awaiting_approval otherwise.
 		// The working-tree diff that shows what the agent changed is NOT
 		// attached here: it is unbounded, and one frame over the transport
@@ -917,6 +998,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			finalExitCode:  finalExitCode,
 			logPath:        logPath,
 			currentRoundID: currentRoundID,
+			actionSource:   approvalSourceUser,
 			writeLog:       writeLog,
 			phaseStart:     &phaseStart,
 			nextTrigger:    &nextTrigger,

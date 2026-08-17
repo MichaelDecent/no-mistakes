@@ -308,3 +308,85 @@ func TestSetStepRoundSelectedFindingIDs(t *testing.T) {
 		t.Errorf("expected nil selection_source after clear, got %v", rounds[0].SelectionSource)
 	}
 }
+
+func TestSetStepRoundGateActionRecordsHowTheGateWasAnswered(t *testing.T) {
+	d := openTestDB(t)
+	repo, _ := d.InsertRepo("/tmp/gate-action", "https://example.com/repo.git", "main")
+	run, _ := d.InsertRun(repo.ID, "feature", "head", "base")
+	step, err := d.InsertStepResult(run.ID, types.StepReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	round, err := d.InsertStepRound(step.ID, 1, "initial", nil, nil, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if round.GateAction != nil || round.GateActionSource != nil || round.GateActionReason != nil {
+		t.Fatalf("fresh round already carries a gate action: %+v", round)
+	}
+
+	if err := d.SetStepRoundGateAction(round.ID, "approve", GateActionSourcePolicy, "read-only QA run"); err != nil {
+		t.Fatalf("set gate action: %v", err)
+	}
+	rounds, err := d.GetRoundsByStep(step.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := rounds[0]
+	if got.GateAction == nil || *got.GateAction != "approve" {
+		t.Errorf("gate_action = %v, want approve", got.GateAction)
+	}
+	if got.GateActionSource == nil || *got.GateActionSource != GateActionSourcePolicy {
+		t.Errorf("gate_action_source = %v, want %q", got.GateActionSource, GateActionSourcePolicy)
+	}
+	if got.GateActionReason == nil || *got.GateActionReason != "read-only QA run" {
+		t.Errorf("gate_action_reason = %v, want the reason", got.GateActionReason)
+	}
+}
+
+func TestSetStepRoundGateActionBoundsTheReason(t *testing.T) {
+	d := openTestDB(t)
+	repo, _ := d.InsertRepo("/tmp/gate-action-bound", "https://example.com/repo.git", "main")
+	run, _ := d.InsertRun(repo.ID, "feature", "head", "base")
+	step, _ := d.InsertStepResult(run.ID, types.StepReview)
+	round, _ := d.InsertStepRound(step.ID, 1, "initial", nil, nil, 5)
+
+	long := ""
+	for len(long) < maxGateActionReason*3 {
+		long += "a reason that keeps going and going. "
+	}
+	if err := d.SetStepRoundGateAction(round.ID, "approve", GateActionSourcePolicy, long); err != nil {
+		t.Fatalf("set gate action: %v", err)
+	}
+	rounds, _ := d.GetRoundsByStep(step.ID)
+	stored := rounds[0].GateActionReason
+	if stored == nil {
+		t.Fatal("gate_action_reason = nil, want a bounded reason")
+	}
+	// A reason is provenance for a status surface, never a payload: the column
+	// cannot be an unbounded sink for whatever a policy hands it.
+	if len(*stored) > maxGateActionReason+3 {
+		t.Fatalf("stored reason is %d bytes, want at most %d", len(*stored), maxGateActionReason+3)
+	}
+}
+
+func TestSetStepRoundGateActionEmptyActionClearsEveryColumn(t *testing.T) {
+	d := openTestDB(t)
+	repo, _ := d.InsertRepo("/tmp/gate-action-clear", "https://example.com/repo.git", "main")
+	run, _ := d.InsertRun(repo.ID, "feature", "head", "base")
+	step, _ := d.InsertStepResult(run.ID, types.StepReview)
+	round, _ := d.InsertStepRound(step.ID, 1, "initial", nil, nil, 5)
+
+	if err := d.SetStepRoundGateAction(round.ID, "fix", GateActionSourcePolicy, "converging"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetStepRoundGateAction(round.ID, "", GateActionSourcePolicy, "converging"); err != nil {
+		t.Fatal(err)
+	}
+	rounds, _ := d.GetRoundsByStep(step.ID)
+	got := rounds[0]
+	// Never a source or reason with no action beside it.
+	if got.GateAction != nil || got.GateActionSource != nil || got.GateActionReason != nil {
+		t.Fatalf("clearing left %+v", got)
+	}
+}
