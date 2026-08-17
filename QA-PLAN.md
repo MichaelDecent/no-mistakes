@@ -4,7 +4,7 @@
 > (`claude/qa-agent-multi-repo-plan-siv96n`). It exists so a new session can pick the work up mid-stream.
 > **Delete it in a final commit before this branch merges.**
 >
-> Specs S1–S15 are complete and pushed. **Start at S16.**
+> Specs S1–S16 are complete and pushed. **Start at S17.**
 
 ---
 
@@ -38,7 +38,7 @@ CREATE/INSERT/SELECT against `modernc.org/sqlite`).
 **The `SourceYAML` credential spill is also fixed** — `65ac9e5`, the second local commit. That was the
 one ship-blocking item, so it deliberately landed on its own rather than inside a larger phase.
 
-**STAGES A, B, AND C ARE COMPLETE, AND STAGE D IS UNDERWAY — S1–S15 of 23, all pushed to PR #1.**
+**STAGES A, B, AND C ARE COMPLETE, AND STAGE D IS UNDERWAY — S1–S16 of 23, all pushed to PR #1.**
 
 | Spec | Commit |
 |---|---|
@@ -50,40 +50,23 @@ one ship-blocking item, so it deliberately landed on its own rather than inside 
 | S13 lifecycle blocking classification | `5d84391` |
 | S14 `applyApprovalAction` seam | `3d28d90` |
 | S15 `GatePolicy` seam + both policies | `0afa116` |
+| S16 skip sets + commit-derived intent | `3f448d8` |
 
-**Next: S16** (skip sets + commit-derived intent), then S17–S18 to reach the first useful milestone:
-`qa run --mode report` producing a real report.
+**Next: S17** (`StartQARun` + the `qa run` command), then S18 for the first useful milestone: a real report.
 
-**What S15 hands S16.** The seam is complete and installed, but **nothing creates a QA run yet**, so every
-policy path is still unreachable in production:
+**What S16 hands S17.** The whole run-creation path is now scope-aware, so S17's `StartQARun` is a thin
+caller rather than a second start path:
 
-- `internal/pipeline/gatepolicy.go` owns `GateRequest`, `GateDecision`, `GatePolicy`, `SetGatePolicy`, and
-  the single consult helper `resolveGateByPolicy`, called from `executeStep` and from `Resume`.
-- `internal/qa/policy.go` owns `PolicyFor(kind, mode)` plus `readOnlyGatePolicy` and
-  `convergingGatePolicy`. `PolicyFor` is the only place a kind/mode pair becomes a policy.
-- `internal/daemon/manager.go` `gatePolicyForRun(run)` reads the run row through
-  `types.NormalizeRunKind`/`NormalizeRunMode` and is called on **both** the start path (next to
-  `SetSkippedSteps`, inert today because every started run is a gate run) and the recovery path. S16/S17
-  therefore only have to write the right `run_kind`/`run_mode`; no further wiring is needed to make gates
-  resolve.
-- `runs.skipped_steps` is still unread — that is S16 — and `db.StepRound` now carries
-  `GateAction`/`GateActionSource`/`GateActionReason`, which S18's report can read as gate provenance.
-
-### Deviations recorded while implementing Stage B/C
-
-1. **The duplicate-name check moved twice** — planned for S4, reassigned to S8, and finally landed in
-   **S10's `ReconcileConnected`**. Only a caller holding the whole spec set can distinguish "two names for
-   one repository" from a *rename*, and renaming is explicitly supported because it preserves the gate and
-   run history. `EnsureConnected` refuses only what it can decide alone.
-2. **A connected repo's URL must be scheme-qualified or `host:path`.** A filesystem path and `file://`
-   both resolve to `invalid remote`. See the S8 spec section for the three options when this bites at
-   S19/e2e.
-3. **`db.Run` had no `RunKind`/`RunMode` fields** — S1 added the columns but never the struct fields or
-   the scan, so a run's kind could not be read at all. Closed in S12.
-4. **S12's QA-never-supersedes-gate refusal is implemented but not wired.**
-   `activeGateRunForBranch` exists and is correct; the call site needs a run-kind parameter on
-   `startRunWithIntentSource` that only arrives with S16/S17. **Wire it there** — this is the one piece of
-   deliberately unfinished business carried forward.
+- `startRunWithIntentSource` takes a `runScope{kind, mode}` (`internal/daemon/runscope.go`). Pass
+  `runScope{types.RunKindQA, mode}` and the rest happens: QA admission through `slots.TryAcquireQA`, the
+  refusal to supersede an active gate run, the mode's skip set, the commit-derived intent, the scoped
+  config, `db.InsertRunWithScope`, and the gate policy.
+- **S12's deferred wiring is done.** `activeGateRunForBranch` and `runSlots` are both called now, so
+  deviation 4 of the Stage B/C list is closed.
+- S17 still owns: the `qa_run` IPC method through `refuseNested`, the CLI command with the `--mode fix-pr`
+  consent line requiring `--yes`, `resolveRepo`/`--repo`, and the QA-mode source of `baseSHA` (today a
+  caller must supply it; `commitDerivedIntent` already tolerates an empty or unusable base).
+- Still unwritten by anything: `runs.trigger`, `runs.watch_id`, `runs.qa_verdict` (S18-S20).
 
 ### Deviations recorded while implementing S15
 
@@ -118,6 +101,43 @@ policy path is still unreachable in production:
 
 `docs/src/content/docs/concepts/qa.md` gained the "Nobody is there to answer a gate" section; it is the
 owner of that model fact.
+
+### Deviations recorded while implementing S16
+
+1. **Two real bugs were found by writing the tests, not by reading the plan.**
+   - `executeRecoveredRemainder` did not honor `e.skips`, so a read-only QA run resumed after a crash would
+     have run every step it declared it would not - including `push` and `pr`. Recovery now applies the skip
+     check exactly as `Execute` does, and reinstalls the declaration from `runs.skipped_steps`. Regression:
+     `TestRecoveredRunRemainderStillHonorsItsSkipSet`.
+   - Auto-fix rounds fire BEFORE a gate is reached, so the S15 policy could not see them: with the shipped
+     defaults (`lint 3`, `test 3`, `document 3`, `rebase 3`, `ci 3`) a `report` run would have run agents
+     that edit and commit code, and then reported the repaired code as clean. `applyRunScopeToConfig` zeroes
+     every auto-fix budget for the read-only modes; `fix-pr` keeps its configured budgets. Regressions:
+     `TestReadOnlyQARunNeverGetsAnAutoFixBudget`, `TestFixPRQARunKeepsItsAutoFixBudget`,
+     `TestGateRunConfigIsNeverNarrowedByScope`.
+2. **The intent step refuses transcripts structurally, not just incidentally.** Stamping a commit-derived
+   intent makes the step short-circuit, but a branch with no derivable intent would have fallen through to
+   scanning. A QA run now returns before the scan either way. Regressions:
+   `TestQARunNeverScansLocalTranscripts`, `TestQARunWithoutCommitIntentStillNeverScansTranscripts`.
+3. **`ValidateRecoveredRun` needed no change.** `recoveredGate` already accepts `skipped` before the gate and
+   requires `pending` after it, which is exactly the shape a parked read-only run has, because skips are
+   applied as steps are reached rather than marked upfront. The test was rewritten to the real shape (gate at
+   `lint` with `document` already skipped) instead of the code being loosened.
+4. **The scope columns are written in the run's own INSERT**, not by a follow-up UPDATE: a run whose scope
+   arrived a moment later would be readable as a gate run in between, and gate is the widest scope there is.
+   A gate run still writes NULL for all three, so its row is unchanged
+   (`TestInsertRunWithIntentLeavesTheScopeColumnsUntouched`).
+5. **`runs.skipped_steps` is a declaration, not a mirror of the step rows.** Steps can still self-skip for
+   their own reasons (an unconfigured command, a disabled feature), so the test asserts the honest direction:
+   every declared step IS skipped, and nothing outside the declaration is.
+6. **Skip semantics are a union, never a replacement.** A mode's declaration can only add to the explicit
+   per-run skips a caller passed, and for a gate run `SkipSetFor` contributes nothing, so a standing rule
+   still cannot skip a step on an author's behalf.
+
+Documented in `docs/src/content/docs/concepts/qa.md`: where a QA run's intent comes from, the zero auto-fix
+budget, and the one honest limit left - with `commands.lint` unset, lint's normal pass still applies and
+commits safe fixes in the disposable worktree, so a read-only run's lint findings describe the code after
+those fixes. The real fix is the deferred `sctx.ReadOnly` flag suppressing `commitAgentFixes`.
 
 ---
 
@@ -1044,8 +1064,12 @@ before any park side effect, and the recovery reinstall. Tests landed as
 `TestReportModeRunNeverSetsAwaitingAgentSince`, `TestPolicyResolvedGateRejectsIPCRespond`,
 `TestRecoveredQARunReinstallsItsGatePolicyAndSkipSet`.
 
-**S16 — Skip sets + commit-derived intent** · *depends: S15* `↳`
-Apply `SkipSetFor` at run start, record `runs.skipped_steps`, supply `RunIntentSourceCommits`.
+**S16 ✅ Skip sets + commit-derived intent** · *depends: S15* `↳`
+`SkipSetFor` applied at run start, `runs.skipped_steps` recorded in the same statement as the run row,
+`RunIntentSourceCommits` derived from the branch's commits, and the run slots plus gate-supersede refusal
+wired. Tests: `internal/daemon/runscope_test.go`, `internal/db/runscope_test.go`,
+`internal/pipeline/executor_skipset_test.go`, `internal/pipeline/steps/qa_scope_test.go`, and the
+report-mode rebase-conflict test in `internal/qa/policy_test.go`.
 *Tests:* `TestSkipSetForIsExhaustiveOverModes`, `TestReportAndCommentSkipSetsAreIdentical`,
 `TestValidateRecoveredRunAcceptsQARunWithSkippedSteps`, `TestRunSkippedStepsColumnMatchesSkippedStepResults`,
 `TestSkippedDocumentStepFallsBackToLintOwnAgentPass`, `TestQARunIntentIsCommitDerivedAndNonAuthoritative`,
