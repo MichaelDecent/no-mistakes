@@ -49,6 +49,26 @@ func (s *IntentStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.Step
 		}
 	}()
 
+	// A QA run never reads local transcripts, whether or not it carries an
+	// intent. There is no author sitting at this machine: the repository has no
+	// working clone here, and the operator's own sessions describe their own
+	// work, not the connected repository's branch. Its intent is derived from
+	// that branch's own commits at run creation instead.
+	if sctx != nil && sctx.Run != nil && types.NormalizeRunKind(sctx.Run.RunKind) == types.RunKindQA {
+		hasIntent := sctx.Run.Intent != nil && strings.TrimSpace(*sctx.Run.Intent) != ""
+		if sctx.Log != nil {
+			if hasIntent {
+				sctx.Log("using the intent derived from this branch's commits")
+			} else {
+				sctx.Log("no commit-derived intent for this branch; local transcripts are never read for QA runs")
+			}
+		}
+		if hasIntent {
+			return &pipeline.StepOutcome{}, nil
+		}
+		return &pipeline.StepOutcome{Skipped: true}, nil
+	}
+
 	// An agent-supplied intent is authoritative: the run already carries it,
 	// so use it verbatim and skip transcript-based inference (which is slower
 	// and flakier). This applies even when extraction is disabled in config.

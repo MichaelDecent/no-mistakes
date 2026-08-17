@@ -542,6 +542,17 @@ func (e *Executor) executeRecoveredRemainder(ctx context.Context, run *db.Run, r
 		if index >= len(results) || results[index].StepName != e.steps[index].Name() || results[index].Status != types.StepStatusPending {
 			return e.failRun(run, repo, fmt.Errorf("recovered step plan changed at %d", index), ctx)
 		}
+		// A recovered run's skip declaration still governs its remaining steps.
+		// Without this, a read-only QA run resumed after a crash would run the
+		// steps it declared it would not - including push and pr, which is the
+		// difference between observing a repository and writing to it.
+		if e.skips[e.steps[index].Name()] {
+			if err := e.db.CompleteStepWithStatus(results[index].ID, types.StepStatusSkipped, 0, 0, ""); err != nil {
+				return e.failRun(run, repo, fmt.Errorf("skip recovered step %s: %w", e.steps[index].Name(), err), ctx)
+			}
+			e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, e.steps[index].Name(), string(types.StepStatusSkipped), "", "", nil)
+			continue
+		}
 		skipRemaining, err := e.executeStep(ctx, e.steps[index], results[index], run, repo, workDir, logDir, stepExecutionState{})
 		if err != nil {
 			return e.failRun(run, repo, err, ctx)

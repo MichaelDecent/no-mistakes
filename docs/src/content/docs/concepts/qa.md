@@ -60,6 +60,18 @@ against a stale base would re-report issues that are already fixed.
 One consequence to know: because `document` is skipped, a `report` or `comment` run produces no
 documentation findings.
 
+## Where a QA run's intent comes from
+
+Review asks "what was this branch trying to do", and in the gate scope the answer comes from the author —
+either stated with `--intent` or inferred from their local agent transcripts. Neither exists here: a
+connected repository has no checkout on this machine, and the operator's own sessions describe the
+operator's work, not this branch.
+
+So a QA run's intent is derived from **the branch's own commit messages** at run creation, and the intent
+step never reads a transcript for a QA run — not even when no intent could be derived. Commit messages are
+contributor-authored text rather than a stated contract, so the intent is recorded as a low-confidence
+hint: review weighs it, and it can never become acceptance criteria the pipeline enforces.
+
 ## Nobody is there to answer a gate
 
 Several steps park for a decision when they find something: review, test, and lint hold the run at an
@@ -77,6 +89,16 @@ Two properties hold regardless of mode. A gate run **never** has its gates answe
 parks for the person who pushed. And the CI gate is never answered this way either, in any mode: CI resolves
 itself from the forge's own checks, and answering it early would throw away the mechanism that makes
 unattended CI monitoring work at all.
+
+**A read-only run also has no auto-fix budget.** Auto-fix rounds happen before a gate is ever reached, and
+they run an agent that edits and commits code. In a `report` or `comment` run those commits can never be
+pushed, and they would make the report dishonest: a test the pipeline repaired in a throwaway worktree would
+be reported as a test that passes. So every `auto_fix.*` limit is zero for these modes regardless of
+configuration, and `fix-pr` keeps the budgets it is configured with.
+
+One honest limit remains: when `commands.lint` is unset, the lint step's normal pass asks an agent to apply
+safe fixes and commits them in the disposable worktree. Nothing is pushed, but a read-only run's lint
+findings describe the code after those fixes rather than exactly as it arrived.
 
 ## Verdict is about the code; status is about the run
 

@@ -3,8 +3,10 @@ package qa
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
@@ -307,5 +309,88 @@ func TestReportModeApproveKeepsStepFindingsAndRoundIntact(t *testing.T) {
 	}
 	if rounds[0].GateActionSource == nil || *rounds[0].GateActionSource != db.GateActionSourcePolicy {
 		t.Errorf("gate_action_source = %v, want %q", rounds[0].GateActionSource, db.GateActionSourcePolicy)
+	}
+}
+
+// autoFixableGateStep mimics the rebase step's conflict outcome: an approval
+// gate that also declares itself auto-fixable.
+type autoFixableGateStep struct {
+	name     types.StepName
+	findings string
+	calls    int
+	fixing   int
+}
+
+func (s *autoFixableGateStep) Name() types.StepName { return s.name }
+
+func (s *autoFixableGateStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	s.calls++
+	if sctx.Fixing {
+		s.fixing++
+		return &pipeline.StepOutcome{}, nil
+	}
+	return &pipeline.StepOutcome{NeedsApproval: true, AutoFixable: true, Findings: s.findings}, nil
+}
+
+// headRecordingStep records the run head the steps after the gate observe.
+type headRecordingStep struct {
+	name types.StepName
+	head string
+	ran  bool
+}
+
+func (s *headRecordingStep) Name() types.StepName { return s.name }
+
+func (s *headRecordingStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	s.ran = true
+	s.head = sctx.Run.HeadSHA
+	return &pipeline.StepOutcome{}, nil
+}
+
+func TestReportModeApprovesRebaseConflictAndValidatesUnrebasedHead(t *testing.T) {
+	database, p, run, repo := setupRun(t)
+	conflict := `{"findings":[{"severity":"warning","file":"shared.txt","description":"merge conflict rebasing onto origin/feature"}],"summary":"conflict rebasing onto origin/feature"}`
+	rebase := &autoFixableGateStep{name: types.StepRebase, findings: conflict}
+	review := &headRecordingStep{name: types.StepReview}
+
+	// A read-only QA run carries no auto-fix budget (the daemon zeroes it), so a
+	// rebase conflict reaches the gate instead of being handed to a fix agent.
+	exec := pipeline.NewExecutor(database, p, &config.Config{}, nil, []pipeline.Step{rebase, review}, nil)
+	exec.SetGatePolicy(PolicyFor(types.RunKindQA, types.RunModeReport))
+
+	if err := exec.Execute(context.Background(), run, repo, t.TempDir()); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	if rebase.fixing != 0 {
+		t.Errorf("rebase ran %d fix rounds, want 0: a read-only run never resolves conflicts", rebase.fixing)
+	}
+	if rebase.calls != 1 {
+		t.Errorf("rebase step ran %d times, want 1", rebase.calls)
+	}
+	// The conflict is recorded and validation continues on the unrebased head,
+	// rather than the run stopping at the first thing it could not rebase.
+	if !review.ran {
+		t.Fatal("review never ran: the approved conflict gate must not end the run")
+	}
+	if review.head != run.HeadSHA {
+		t.Errorf("review saw head %q, want the unrebased head %q", review.head, run.HeadSHA)
+	}
+	steps, err := database.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if steps[0].Status != types.StepStatusCompleted {
+		t.Errorf("rebase status = %q, want %q", steps[0].Status, types.StepStatusCompleted)
+	}
+	if steps[0].FindingsJSON == nil || !strings.Contains(*steps[0].FindingsJSON, "merge conflict") {
+		t.Error("the conflict finding was not preserved for the report")
+	}
+	finished, err := database.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished.Status != types.RunCompleted {
+		t.Fatalf("run status = %q, want %q", finished.Status, types.RunCompleted)
 	}
 }

@@ -116,7 +116,8 @@ func gatePolicyForRun(run *db.Run) pipeline.GatePolicy {
 	if run == nil {
 		return nil
 	}
-	return qa.PolicyFor(types.NormalizeRunKind(run.RunKind), types.NormalizeRunMode(run.RunMode))
+	scope := runScopeFromRun(run)
+	return qa.PolicyFor(scope.kind, scope.mode)
 }
 
 type recoveredRunPlan struct {
@@ -262,6 +263,7 @@ func (m *RunManager) loadRecoveredConfig(ctx context.Context, run *db.Run, repo 
 	effectiveRepoCfg := config.EffectiveRepoConfig(repoCfg, trustedRepoCfg, allowRepoCommands)
 	cfg := config.MergeWithRepoPolicy(globalCfg, effectiveRepoCfg, globalCfg.RepoPolicyFor(repoPolicyKey(repo)))
 	cfg.TrustedConfigSHA = trustedSHA
+	cfg = applyRunScopeToConfig(cfg, runScopeFromRun(run))
 	if globalCfg.Eval.CaptureProvenance {
 		if err := cfg.EnableEvalProvenance(globalCfg, effectiveRepoCfg); err != nil {
 			return nil, err
@@ -352,10 +354,16 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 	}
 	runCtx, cancel := context.WithCancelCause(context.Background())
 	executor := pipeline.NewExecutor(m.db, m.paths, plan.cfg, plan.agent, plan.steps, m.broadcast)
-	// A resumed run must be answered the same way it was before the crash, so
-	// the policy is reinstalled from the run's own stored kind and mode rather
-	// than inferred from anything about the recovery path.
+	// A resumed run must be answered - and bounded - the same way it was before
+	// the crash, so both the policy and the skip declaration are reinstalled from
+	// the run's own row rather than inferred from anything about the recovery
+	// path. Without the skips, a read-only run would resume into the steps that
+	// push a branch and open a PR.
 	executor.SetGatePolicy(gatePolicyForRun(plan.run))
+	executor.SetSkippedSteps(plan.run.SkippedStepNames())
+	// A crash-recovery resume is interactive work: counted against the ceiling
+	// QA respects, never refused.
+	releaseSlot := m.slots.AcquireInteractive()
 	done := make(chan struct{})
 	m.mu.Lock()
 	m.executors[plan.run.ID] = executor
@@ -368,6 +376,7 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 		startedAt := time.Now()
 		defer m.wg.Done()
 		defer close(done)
+		defer releaseSlot()
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				errMsg := fmt.Sprintf("internal panic: %v", recovered)
@@ -746,7 +755,9 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 		}
 	}
 
-	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource)
+	// A rerun of any run is an author-side gate run: a person asked for it at a
+	// terminal, which is the same consent boundary as a push.
+	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource, gateRunScope())
 }
 
 // fetchRunDefaultBranch fetches the trusted branch from the refreshed
@@ -767,13 +778,13 @@ func fetchRunDefaultBranch(ctx context.Context, workDir string, repo *db.Repo) e
 // A non-empty intent is stamped onto the run as agent-supplied, so the intent
 // step uses it instead of inferring from transcripts.
 func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent string) (string, error) {
-	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, db.RunIntentSourceAgent)
+	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, db.RunIntentSourceAgent, gateRunScope())
 }
 
 // startRunWithIntentSource is the common run-creation path. source is empty
 // when no intent is supplied, RunIntentSourceAgent for a new explicit
 // override, and RunIntentSourceRerun for inherited explicit intent.
-func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source string) (string, error) {
+func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source string, scope runScope) (string, error) {
 	branchRole := telemetryBranchRole(branch, repo.DefaultBranch)
 	trackStartFailure := func(stage string) {
 		telemetry.Track("run", telemetry.Fields{
@@ -794,6 +805,42 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 	lockKey := repo.ID + "/" + branch
 	releaseBranch := m.branchLocks.Acquire(lockKey)
 	defer releaseBranch()
+
+	// Admission, under the branch lock so the answer cannot race a concurrent
+	// start on the same branch.
+	//
+	// An interactive run - a push or a rerun - is counted but never refused:
+	// "validation must not hold the author hostage" is the product's core
+	// promise. QA work is capped and yields, because a declined QA item is
+	// re-derived by the next sweep while a declined push is simply lost.
+	var releaseSlot func()
+	if scope.isQA() {
+		// A QA run never supersedes an active gate run. The author's push is
+		// newer truth about that branch and it is the one with a person waiting.
+		if gateRunID, err := m.activeGateRunForBranch(repo.ID, branch); err != nil {
+			trackStartFailure("active_gate_lookup")
+			return "", err
+		} else if gateRunID != "" {
+			trackStartFailure("active_gate_run")
+			return "", fmt.Errorf("gate run %s is active for %s; QA declines the branch", gateRunID, branch)
+		}
+		release, admitted := m.slots.TryAcquireQA()
+		if !admitted {
+			trackStartFailure("qa_at_capacity")
+			return "", fmt.Errorf("QA run capacity reached; not starting a run for %s", branch)
+		}
+		releaseSlot = release
+	} else {
+		releaseSlot = m.slots.AcquireInteractive()
+	}
+	// The background goroutine takes the slot over once it launches; until then
+	// every early return must release it.
+	bgOwnsSlot := false
+	defer func() {
+		if !bgOwnsSlot {
+			releaseSlot()
+		}
+	}()
 
 	if repo.Connected() {
 		// SECURITY: deliberately NOT best-effort, unlike the local branch below.
@@ -832,9 +879,26 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 			source = db.RunIntentSourceAgent
 		}
 		runIntent = &db.RunIntent{Summary: storedIntent, Source: source, Score: 1}
+	} else if scope.isQA() {
+		// Nobody stated this run's goal, so it comes from the branch's own
+		// commits. This keeps review's "what was this trying to do" axis without
+		// the intent step reading anyone's local transcripts, and it is stamped
+		// non-authoritative because commit messages are contributor-authored
+		// text rather than an operator contract.
+		if derived := commitDerivedIntent(ctx, m.paths.RepoDir(repo.ID), baseSHA, headSHA); derived != "" {
+			runIntent = &db.RunIntent{
+				Summary: derived,
+				Source:  db.RunIntentSourceCommits,
+				Score:   db.RunIntentScoreCommits,
+			}
+		}
 	}
 
-	run, err := m.db.InsertRunWithIntent(repo.ID, branch, headSHA, baseSHA, runIntent)
+	// The skip declaration is settled before the run row exists, so the row and
+	// the executor can never disagree about what this run intended to run.
+	skipSteps = effectiveSkipSteps(scope, skipSteps)
+
+	run, err := m.db.InsertRunWithScope(repo.ID, branch, headSHA, baseSHA, runIntent, scope.dbScope(skipSteps))
 	if err != nil {
 		trackStartFailure("create_run")
 		return "", fmt.Errorf("create run: %w", err)
@@ -931,6 +995,7 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 	}
 	cfg := config.MergeWithRepoPolicy(globalCfg, effectiveRepoCfg, globalCfg.RepoPolicyFor(repoPolicyKey(repo)))
 	cfg.TrustedConfigSHA = trustedSHA
+	cfg = applyRunScopeToConfig(cfg, scope)
 	if globalCfg.Eval.CaptureProvenance {
 		if err := cfg.EnableEvalProvenance(globalCfg, effectiveRepoCfg); err != nil {
 			m.db.UpdateRunError(run.ID, err.Error())
@@ -1008,8 +1073,9 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 	m.dones[run.ID] = done
 	m.mu.Unlock()
 
-	// Background goroutine now owns worktree cleanup.
+	// Background goroutine now owns worktree cleanup and the run slot.
 	bgOwnsWorktree = true
+	bgOwnsSlot = true
 
 	// Launch pipeline in background.
 	m.wg.Add(1)
@@ -1017,6 +1083,9 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		startedAt := time.Now()
 		defer m.wg.Done()
 		defer close(done)
+		// The slot is held for the whole run, so QA admission reflects work
+		// actually in flight rather than starts attempted.
+		defer releaseSlot()
 		defer func() {
 			if r := recover(); r != nil {
 				errMsg := fmt.Sprintf("internal panic: %v", r)
