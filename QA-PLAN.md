@@ -4,7 +4,7 @@
 > (`claude/qa-agent-multi-repo-plan-siv96n`). It exists so a new session can pick the work up mid-stream.
 > **Delete it in a final commit before this branch merges.**
 >
-> Specs S1–S14 are complete and pushed. **Start at S15.**
+> Specs S1–S15 are complete and pushed. **Start at S16.**
 
 ---
 
@@ -38,7 +38,7 @@ CREATE/INSERT/SELECT against `modernc.org/sqlite`).
 **The `SourceYAML` credential spill is also fixed** — `65ac9e5`, the second local commit. That was the
 one ship-blocking item, so it deliberately landed on its own rather than inside a larger phase.
 
-**STAGES A, B, AND C ARE COMPLETE, AND STAGE D HAS STARTED — S1–S14 of 23, all pushed to PR #1.**
+**STAGES A, B, AND C ARE COMPLETE, AND STAGE D IS UNDERWAY — S1–S15 of 23, all pushed to PR #1.**
 
 | Spec | Commit |
 |---|---|
@@ -49,19 +49,25 @@ one ship-blocking item, so it deliberately landed on its own rather than inside 
 | S12 run slots + self-pruning branch locks | `98f424d` |
 | S13 lifecycle blocking classification | `5d84391` |
 | S14 `applyApprovalAction` seam | `3d28d90` |
+| S15 `GatePolicy` seam + both policies | `0afa116` |
 
-**Next: S15** (the `GatePolicy` seam and both policies), then S16–S18 to reach the first useful
-milestone: `qa run --mode report` producing a real report.
+**Next: S16** (skip sets + commit-derived intent), then S17–S18 to reach the first useful milestone:
+`qa run --mode report` producing a real report.
 
-**What S14 hands S15.** `internal/pipeline/approval_action.go` owns
-`applyApprovalAction(response, run, repo, sr, sctx, approvalActionState) approvalActionResult`, plus the
-`approvalContinuation` values `approvalContinueLoop` / `approvalGateResolved` / `approvalStepFinished`.
-The unattended path in S15 builds an `approvalResponse` from its `GateDecision` and calls that same
-function, so policy-resolved and human-answered gates are the same code by construction. Two details the
-refactor deliberately preserved: an **unrecognized action re-executes the step** (it falls out of the
-switch, exactly as before), and the two pointer fields in `approvalActionState` (`phaseStart`,
-`nextTrigger`) are the only loop state the function writes back — everything else it mutates travels
-through `sctx`.
+**What S15 hands S16.** The seam is complete and installed, but **nothing creates a QA run yet**, so every
+policy path is still unreachable in production:
+
+- `internal/pipeline/gatepolicy.go` owns `GateRequest`, `GateDecision`, `GatePolicy`, `SetGatePolicy`, and
+  the single consult helper `resolveGateByPolicy`, called from `executeStep` and from `Resume`.
+- `internal/qa/policy.go` owns `PolicyFor(kind, mode)` plus `readOnlyGatePolicy` and
+  `convergingGatePolicy`. `PolicyFor` is the only place a kind/mode pair becomes a policy.
+- `internal/daemon/manager.go` `gatePolicyForRun(run)` reads the run row through
+  `types.NormalizeRunKind`/`NormalizeRunMode` and is called on **both** the start path (next to
+  `SetSkippedSteps`, inert today because every started run is a gate run) and the recovery path. S16/S17
+  therefore only have to write the right `run_kind`/`run_mode`; no further wiring is needed to make gates
+  resolve.
+- `runs.skipped_steps` is still unread — that is S16 — and `db.StepRound` now carries
+  `GateAction`/`GateActionSource`/`GateActionReason`, which S18's report can read as gate provenance.
 
 ### Deviations recorded while implementing Stage B/C
 
@@ -78,6 +84,40 @@ through `sctx`.
    `activeGateRunForBranch` exists and is correct; the call site needs a run-kind parameter on
    `startRunWithIntentSource` that only arrives with S16/S17. **Wire it there** — this is the one piece of
    deliberately unfinished business carried forward.
+
+### Deviations recorded while implementing S15
+
+1. **The policy consult sits AFTER the execution-timer freeze, not before it.** The design snippet put it
+   before, but `applyApprovalAction` restarts the phase clock, so resolving before
+   `executionMS += time.Since(phaseStart)` discards the round's own execution time and reports every
+   unattended step as instant. The freeze is local arithmetic that nothing can observe, so it is not a park
+   side effect; every actual park side effect (`ParkStepForApproval`, `e.waiting`, the wait) still happens
+   strictly after the consult.
+2. **Cancellation outranks a policy.** `resolveGateByPolicy` declines when the run context is already
+   cancelled, so a run being stopped (shutdown, supersede, abort, `max_run_duration`) cannot be advanced
+   into push/PR/CI by an unattended approval. Regression:
+   `TestGatePolicyDoesNotResolveAGateAfterCancellation`.
+3. **A policy's decisions are attributed to the policy, not to a user.** `applyApprovalAction` gained an
+   `actionSource`, `db.RoundSelectionSourcePolicy` was added, and the `approval` telemetry event — which
+   describes a person answering a gate — is not emitted for a policy decision on either the live or the
+   recovery path. Without this, an unattended fix round records as a human's selection.
+4. **`recoveredRunPlan` needed no new fields.** It already carries the `runs` row, so `gatePolicyForRun`
+   reads kind and mode from `plan.run` instead. That helper is also called on the normal start path, where
+   it is inert (every started run is a gate run, and a gate run always resolves to a nil policy), so both
+   paths share one owner rather than two spellings of the same decision.
+5. **`PolicyFor` returns nil for an unrecognized QA mode** rather than guessing a policy. Nil means the gate
+   parks, which can never write code or approve anything; the run then stalls into the watcher's
+   `max_run_duration`. Unreachable in practice because `NormalizeRunMode` resolves a stored value first.
+6. **`TestRecoveredQARunReinstallsItsGatePolicyAndSkipSet` split in two**, because the skip-set half belongs
+   to S16: `TestResumePolicyResolvesARecoveredGateWithoutWaiting` (pipeline) covers the recovered-gate
+   resolution, and `TestGatePolicyForRunIsNilForEveryGateRun` /
+   `TestGatePolicyForRunInstallsAPolicyForQARuns` (daemon) cover what recovery installs.
+7. **S1's three `step_rounds` gate-action columns got their first Go API here** — struct fields, the SELECT
+   list, `SetStepRoundGateAction`, and the `GateActionSource*` vocabulary — with the reason bounded at the
+   persistence boundary so no future caller can turn the column into a payload sink.
+
+`docs/src/content/docs/concepts/qa.md` gained the "Nobody is there to answer a gate" section; it is the
+owner of that model fact.
 
 ---
 
@@ -994,9 +1034,11 @@ path contains **no** restructuring. Every existing executor/approval test passes
 contract (one case per action, plus the preserved unrecognized-action retry) is pinned by
 `executor_approval_action_test.go`.
 
-**S15 — `GatePolicy` seam + both policies** · *depends: S14* `↳`
-`internal/pipeline/gatepolicy.go`, `ReadOnlyGatePolicy`, `ConvergingGatePolicy`, the single insertion
-point before any park side effect, recovery reinstall.
+**S15 ✅ `GatePolicy` seam + both policies** · *depends: S14* `↳`
+`internal/pipeline/gatepolicy.go`, the two policies in `internal/qa/policy.go`, the single insertion point
+before any park side effect, and the recovery reinstall. Tests landed as
+`internal/pipeline/gatepolicy_test.go`, `internal/qa/policy_test.go`,
+`internal/daemon/gatepolicy_test.go`, and the `db` gate-action round-trip tests.
 *Tests:* `TestGatePolicyNilPreservesBlockingGate`, `TestGatePolicyIsNeverInstalledForGateRuns`,
 `TestPolicyIsNotConsultedForReconcilableCIGate`, `TestFixPRPolicyFixesOnceThenApproves`,
 `TestReportModeRunNeverSetsAwaitingAgentSince`, `TestPolicyResolvedGateRejectsIPCRespond`,
