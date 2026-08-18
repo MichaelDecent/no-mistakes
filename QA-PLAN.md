@@ -25,22 +25,27 @@ First real signal, run 4 on `9edef0c`: `check`, `e2e`, `build`, the generated-fi
 that — the `go test -race ./...` Linux leg, which `AGENTS.md` designates as the owner of full regression
 coverage, passes on CI while five process-reaping tests fail in this sandbox.
 
-Two legs failed and one is a policy check:
+**Every test leg is now green on `9f3016c`** — ubuntu, macOS, windows, plus `check`, `e2e`, `build`, and
+the generated-files guard. The macOS and Windows failures were one root cause, fixed in `16944c5` and
+`9f3016c`: a connected registration stored the identity stub's path unresolved, while every path-keyed
+lookup resolves first (`findRepo`, `Eject`, `branchsync.OpenCurrent` all ask git, which reports a resolved
+root). Wherever the platform aliases a directory the two never matched — `/var` vs `/private/var` on macOS,
+an 8.3 short name on Windows — so the connected guard never fired and surfaces refused with "repo not
+initialized" instead. Registration now stores what every reader looks up, which is what the local path
+always did. `TestEnsureConnectedStoresAStubPathEveryLookupCanFind` registers under a symlinked state root,
+so the Linux leg catches this class rather than leaving it to the other two.
 
-- **macOS**: five tests across `internal/branchsync`, `internal/cli`, and `internal/gate`, all one root
-  cause — a connected registration stored the identity stub's path unresolved while every path-keyed
-  lookup resolves it first (macOS aliases `/var` to `/private/var`). Fixed in `16944c5`.
-- **Windows**: failed for reasons the log does not reveal. The Windows leg runs `go test -v`, which
-  produces a log whose failing section is far outside the tail the GitHub API will return, and the full
-  log archive host is blocked by this container's proxy. Most likely the same path-alias class (Windows
-  temp dirs carry 8.3 short names, which `FindGitRoot`'s `EvalSymlinks` expands), so `16944c5` is the
-  first thing to check against. **If Windows still fails, make the leg diagnosable before chasing it** —
-  dropping `-v` would put failures back in the retrievable tail, and the workflow contract test only pins
-  `-timeout`, not `-v`.
-- **`PR must be raised via no-mistakes`**: expected and not fixable from the code. That workflow requires
-  the PR body to carry the marker `Updates from [git push no-mistakes](...)`, which only the tool's own PR
-  step writes. PR #1 was raised by hand. Do **not** paste the marker in: the check exists to assert the
-  PR came through the pipeline, and writing it manually would make the check lie.
+**One check stays red on purpose: `PR must be raised via no-mistakes`.** That workflow requires the PR body
+to carry the marker `Updates from [git push no-mistakes](...)`, which only the tool's own PR step writes,
+and PR #1 was raised by hand. Do **not** paste the marker in: the check exists to assert the PR came
+through the pipeline, and writing it manually would make the check lie.
+
+**Diagnosability note for whoever hits the next Windows failure.** That leg runs `go test -v`, whose log is
+so large that the failing section falls outside the tail the GitHub API returns, and the full log archive
+host is blocked by this container's proxy. Two ways through: narrow by elimination (package `ok` lines in
+the retrievable tail bound the failure to the packages alphabetically before the first one shown), or drop
+`-v` so failures land in the tail like the other legs — the workflow contract test pins `-timeout`, not
+`-v`.
 
 Three corrections landed during Phase 1 and are already reflected below: `rebase` and `intent` are
 NOT skipped in QA modes (verified: `rebase.go` has zero `git.Push*` calls and aborts on conflict;
