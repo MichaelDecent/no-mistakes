@@ -46,7 +46,7 @@ func TestFindRepoRefusesConnectedRepo(t *testing.T) {
 			mustGit(t, stub, "config", "user.email", "qa@example.test")
 			mustGit(t, stub, "config", "user.name", "QA")
 			if _, err := database.InsertConnectedRepo(
-				id, stub, "https://example.test/acme/api.git", "example.test/acme/api", "acme-api", "main",
+				id, resolvedRepoPath(t, stub), "https://example.test/acme/api.git", "example.test/acme/api", "acme-api", "main",
 			); err != nil {
 				t.Fatal(err)
 			}
@@ -99,7 +99,7 @@ func TestFindRepoStillResolvesLocalRepos(t *testing.T) {
 
 	clone := filepath.Join(root, "operator")
 	mustGit(t, root, "init", clone)
-	inserted, err := database.InsertRepo(clone, "https://example.test/acme/api.git", "main")
+	inserted, err := database.InsertRepo(resolvedRepoPath(t, clone), "https://example.test/acme/api.git", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +111,66 @@ func TestFindRepoStillResolvesLocalRepos(t *testing.T) {
 	}
 	if repo == nil || repo.ID != inserted.ID {
 		t.Fatalf("findRepo = %+v, want the inserted local repo %s", repo, inserted.ID)
+	}
+}
+
+// resolvedRepoPath is what a repository row actually stores. Registration goes
+// through git, which reports a symlink-resolved root, so a hand-inserted row
+// must store the same thing or no lookup will ever match it. This is not a
+// macOS quirk to work around: /var vs /private/var on macOS and 8.3 short names
+// on Windows are just where an unresolved fixture path stops matching.
+func resolvedRepoPath(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return path
+	}
+	return resolved
+}
+
+// TestFindRepoRefusesConnectedRepoReachedThroughASymlink pins the same guard
+// when the working directory is reached by an aliased path. macOS temp dirs are
+// symlinks and Windows temp dirs carry short names, so this case is the norm on
+// two of the three CI platforms; running it explicitly means Linux catches a
+// regression too instead of leaving it to the other legs.
+func TestFindRepoRefusesConnectedRepoReachedThroughASymlink(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	p := paths.WithRoot(filepath.Join(root, "state"))
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	stub := filepath.Join(alias, "stub")
+	mustGit(t, root, "init", stub)
+	if _, err := database.InsertConnectedRepo(
+		"aabbccddeeff", resolvedRepoPath(t, stub), "https://example.test/acme/api.git", "example.test/acme/api", "acme-api", "main",
+	); err != nil {
+		t.Fatal(err)
+	}
+	// Enter through the alias, which is what a person or a daemon-owned path
+	// under a symlinked root actually does.
+	t.Chdir(stub)
+
+	repo, err := findRepo(database)
+	if err == nil {
+		t.Fatalf("findRepo returned %+v through an aliased path; it must refuse", repo)
+	}
+	if !strings.Contains(err.Error(), "connected") {
+		t.Fatalf("error %q does not name the connected registration", err)
 	}
 }
 

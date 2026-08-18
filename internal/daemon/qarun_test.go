@@ -15,6 +15,17 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
+// resolvedTestPath mirrors what registration records: git reports a
+// symlink-resolved root, and every path-keyed lookup resolves before it asks.
+func resolvedTestPath(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return path
+	}
+	return resolved
+}
+
 func qaGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -84,14 +95,17 @@ func newConnectedFixture(t *testing.T, stepFactory StepFactory) *connectedFixtur
 	headSHA := qaGit(t, work, "rev-parse", "HEAD")
 
 	repoID := "connected0001"
-	stub := filepath.Join(p.Root(), "stubs", repoID)
+	stub := p.SourceDir(repoID)
 	if err := os.MkdirAll(stub, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	qaGit(t, filepath.Dir(stub), "init", stub)
 	qaGit(t, stub, "config", "--local", "user.name", "QA Bot")
 	qaGit(t, stub, "config", "--local", "user.email", "qa@example.com")
-	repo, err := database.InsertConnectedRepo(repoID, stub, upstream, "example.com/acme/api", "acme-api", "main")
+	// EnsureConnected stores the symlink-resolved stub path, so the fixture
+	// stores the same thing: an unresolved path stops matching wherever the
+	// platform aliases directories (macOS /var, Windows 8.3 short names).
+	repo, err := database.InsertConnectedRepo(repoID, resolvedTestPath(t, stub), upstream, "example.com/acme/api", "acme-api", "main")
 	if err != nil {
 		t.Fatal(err)
 	}

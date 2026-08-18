@@ -34,7 +34,8 @@ func insertTestConnectedRepo(t *testing.T, p *paths.Paths, database *db.DB, id, 
 	mustGit(t, p.Root(), "init", stub)
 	mustGit(t, stub, "config", "user.email", "qa@example.test")
 	mustGit(t, stub, "config", "user.name", "QA")
-	repo, err := database.InsertConnectedRepo(id, stub, "https://example.test/acme/"+name+".git", "example.test/acme/"+name, name, "main")
+	// The row stores what registration stores: the resolved path git reports.
+	repo, err := database.InsertConnectedRepo(id, resolvedRepoPath(t, stub), "https://example.test/acme/"+name+".git", "example.test/acme/"+name, name, "main")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -75,7 +75,7 @@ func TestPushReceivedIgnoresRepoQAModeAndRunsAllNineSteps(t *testing.T) {
 	qaGit(t, clone, "push", "gate", "feature")
 	headSHA := qaGit(t, clone, "rev-parse", "HEAD")
 
-	if _, err := database.InsertRepoWithID(repoID, clone, upstream, "main"); err != nil {
+	if _, err := database.InsertRepoWithID(repoID, resolvedTestPath(t, clone), upstream, "main"); err != nil {
 		t.Fatal(err)
 	}
 

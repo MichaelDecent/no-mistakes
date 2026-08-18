@@ -75,8 +75,17 @@ func TestEjectRefusesConnectedRepo(t *testing.T) {
 			const id = "aabbccddeeff"
 			workDir := tc.workingPath(t, p, root, id)
 			mustRunGit(t, root, "init", workDir)
+			// EnsureConnected stores the symlink-resolved stub path, and Eject
+			// resolves before it looks a repository up. A row holding an
+			// unresolved path would be found by neither, so the guard under test
+			// would never be reached - which is exactly what happened on the
+			// macOS leg, where every temp dir is a symlink.
+			storedPath := workDir
+			if resolved, resolveErr := filepath.EvalSymlinks(workDir); resolveErr == nil {
+				storedPath = resolved
+			}
 			if _, err := database.InsertConnectedRepo(
-				id, workDir, "https://example.test/acme/api.git", "example.test/acme/api", "acme-api", "main",
+				id, storedPath, "https://example.test/acme/api.git", "example.test/acme/api", "acme-api", "main",
 			); err != nil {
 				t.Fatal(err)
 			}

@@ -183,10 +183,18 @@ func EnsureConnected(ctx context.Context, d *db.DB, p *paths.Paths, spec config.
 		return repo, nil
 	}
 
+	// The stored working_path is symlink-resolved, because every reader resolves
+	// before it looks up: findRepo, Eject, and branchsync.OpenCurrent all ask git
+	// for the root, and git reports the resolved path (/private/var rather than
+	// /var on macOS, the long name rather than an 8.3 short name on Windows).
+	// The local path already stores what FindMainRepoRoot resolved; storing an
+	// unresolved stub path here would mean no lookup ever matched it, and the
+	// connected guards would degrade to "repo not initialized".
+	//
 	// SECURITY: the stored URL is redacted. The credential lives only on the
 	// gate's own origin remote, which is where the pipeline recovers it from at
 	// run time. This is the database half of invariant C1.
-	repo, err := d.InsertConnectedRepo(id, stubDir, safeurl.Redact(spec.URL), identity, name, defaultBranch)
+	repo, err := d.InsertConnectedRepo(id, resolvePathForCompare(stubDir), safeurl.Redact(spec.URL), identity, name, defaultBranch)
 	if err != nil {
 		cleanup()
 		return nil, fmt.Errorf("repos.%s: register: %w", name, err)

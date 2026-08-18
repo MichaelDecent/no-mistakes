@@ -1,6 +1,7 @@
 package branchsync
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -38,8 +39,17 @@ func newConnectedFixture(t *testing.T) *connectedFixture {
 	mustRun(t, root, "init", stub)
 	configureIdentity(t, stub)
 
+	// Registration stores the symlink-resolved path git reports, so a
+	// hand-inserted row must too: an unresolved fixture path stops matching on
+	// macOS (/var vs /private/var) and Windows (8.3 short names), and then this
+	// test would pass for the wrong reason - refusing because nothing was found
+	// rather than because the repository is connected.
+	resolvedStub := stub
+	if resolved, resolveErr := filepath.EvalSymlinks(stub); resolveErr == nil {
+		resolvedStub = resolved
+	}
 	repo, err := database.InsertConnectedRepo(
-		id, stub, "https://example.test/acme/api.git", "example.test/acme/api", "acme-api", "main",
+		id, resolvedStub, "https://example.test/acme/api.git", "example.test/acme/api", "acme-api", "main",
 	)
 	if err != nil {
 		t.Fatal(err)
