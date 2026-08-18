@@ -4,7 +4,7 @@
 > (`claude/qa-agent-multi-repo-plan-siv96n`). It exists so a new session can pick the work up mid-stream.
 > **Delete it in a final commit before this branch merges.**
 >
-> Specs S1–S16 are complete and pushed. **Start at S17.**
+> Specs S1–S17 are complete and pushed. **Start at S18** — the first genuinely useful milestone.
 
 ---
 
@@ -38,7 +38,7 @@ CREATE/INSERT/SELECT against `modernc.org/sqlite`).
 **The `SourceYAML` credential spill is also fixed** — `65ac9e5`, the second local commit. That was the
 one ship-blocking item, so it deliberately landed on its own rather than inside a larger phase.
 
-**STAGES A, B, AND C ARE COMPLETE, AND STAGE D IS UNDERWAY — S1–S16 of 23, all pushed to PR #1.**
+**STAGES A, B, AND C ARE COMPLETE, AND STAGE D IS UNDERWAY — S1–S17 of 23, all pushed to PR #1.**
 
 | Spec | Commit |
 |---|---|
@@ -51,56 +51,26 @@ one ship-blocking item, so it deliberately landed on its own rather than inside 
 | S14 `applyApprovalAction` seam | `3d28d90` |
 | S15 `GatePolicy` seam + both policies | `0afa116` |
 | S16 skip sets + commit-derived intent | `3f448d8` |
+| S17 `StartQARun` + `qa run` | `ad41004` |
 
-**Next: S17** (`StartQARun` + the `qa run` command), then S18 for the first useful milestone: a real report.
+**Next: S18** — `internal/qareport`, the verdict, and `qa report`. That is the first milestone where the
+work is useful to a person: a QA run already produces findings in the database, but nothing reads them back.
 
-**What S16 hands S17.** The whole run-creation path is now scope-aware, so S17's `StartQARun` is a thin
-caller rather than a second start path:
+**What S17 hands S18.** A QA run can be started and completes end to end:
 
-- `startRunWithIntentSource` takes a `runScope{kind, mode}` (`internal/daemon/runscope.go`). Pass
-  `runScope{types.RunKindQA, mode}` and the rest happens: QA admission through `slots.TryAcquireQA`, the
-  refusal to supersede an active gate run, the mode's skip set, the commit-derived intent, the scoped
-  config, `db.InsertRunWithScope`, and the gate policy.
-- **S12's deferred wiring is done.** `activeGateRunForBranch` and `runSlots` are both called now, so
-  deviation 4 of the Stage B/C list is closed.
-- S17 still owns: the `qa_run` IPC method through `refuseNested`, the CLI command with the `--mode fix-pr`
-  consent line requiring `--yes`, `resolveRepo`/`--repo`, and the QA-mode source of `baseSHA` (today a
-  caller must supply it; `commitDerivedIntent` already tolerates an empty or unusable base).
-- Still unwritten by anything: `runs.trigger`, `runs.watch_id`, `runs.qa_verdict` (S18-S20).
+- `RunManager.StartQARun` (`internal/daemon/qarun.go`) takes a `QARunRequest{RepoID, Branch, Mode, BaseSHA,
+  Trigger}`, refuses a local or detached repository, verifies invariant C1, fetches the branch into the
+  connected gate, resolves the base, and hands off to the scope-aware start path.
+- `ipc.MethodQARun` is registered behind `refuseNested`, and `no-mistakes qa run --repo <name>` drives it.
+- `resolveRepo(d, selector)` (`internal/cli/root.go`) resolves by name, full ID, then unique ID prefix, and
+  refuses an ambiguous prefix. An empty selector still means "this directory", connected refusal included.
+- `RunManager.ApplyQAConfig` sizes the run slots from `qa.max_concurrent`/`qa.max_total_runs` at daemon
+  startup, so those documented keys are now the values in force.
 
-### Deviations recorded while implementing S15
-
-1. **The policy consult sits AFTER the execution-timer freeze, not before it.** The design snippet put it
-   before, but `applyApprovalAction` restarts the phase clock, so resolving before
-   `executionMS += time.Since(phaseStart)` discards the round's own execution time and reports every
-   unattended step as instant. The freeze is local arithmetic that nothing can observe, so it is not a park
-   side effect; every actual park side effect (`ParkStepForApproval`, `e.waiting`, the wait) still happens
-   strictly after the consult.
-2. **Cancellation outranks a policy.** `resolveGateByPolicy` declines when the run context is already
-   cancelled, so a run being stopped (shutdown, supersede, abort, `max_run_duration`) cannot be advanced
-   into push/PR/CI by an unattended approval. Regression:
-   `TestGatePolicyDoesNotResolveAGateAfterCancellation`.
-3. **A policy's decisions are attributed to the policy, not to a user.** `applyApprovalAction` gained an
-   `actionSource`, `db.RoundSelectionSourcePolicy` was added, and the `approval` telemetry event — which
-   describes a person answering a gate — is not emitted for a policy decision on either the live or the
-   recovery path. Without this, an unattended fix round records as a human's selection.
-4. **`recoveredRunPlan` needed no new fields.** It already carries the `runs` row, so `gatePolicyForRun`
-   reads kind and mode from `plan.run` instead. That helper is also called on the normal start path, where
-   it is inert (every started run is a gate run, and a gate run always resolves to a nil policy), so both
-   paths share one owner rather than two spellings of the same decision.
-5. **`PolicyFor` returns nil for an unrecognized QA mode** rather than guessing a policy. Nil means the gate
-   parks, which can never write code or approve anything; the run then stalls into the watcher's
-   `max_run_duration`. Unreachable in practice because `NormalizeRunMode` resolves a stored value first.
-6. **`TestRecoveredQARunReinstallsItsGatePolicyAndSkipSet` split in two**, because the skip-set half belongs
-   to S16: `TestResumePolicyResolvesARecoveredGateWithoutWaiting` (pipeline) covers the recovered-gate
-   resolution, and `TestGatePolicyForRunIsNilForEveryGateRun` /
-   `TestGatePolicyForRunInstallsAPolicyForQARuns` (daemon) cover what recovery installs.
-7. **S1's three `step_rounds` gate-action columns got their first Go API here** — struct fields, the SELECT
-   list, `SetStepRoundGateAction`, and the `GateActionSource*` vocabulary — with the reason bounded at the
-   persistence boundary so no future caller can turn the column into a payload sink.
-
-`docs/src/content/docs/concepts/qa.md` gained the "Nobody is there to answer a gate" section; it is the
-owner of that model fact.
+S18 reads persisted rows only, and everything it needs is already recorded: findings on steps and rounds,
+`gate_action`/`gate_action_source` provenance for every unattended answer, `runs.skipped_steps`, and
+`run_kind`/`run_mode`. Still unwritten by anything: `runs.trigger`, `runs.watch_id`, `runs.qa_verdict`,
+`runs.qa_report_error`.
 
 ### Deviations recorded while implementing S16
 
@@ -138,6 +108,47 @@ Documented in `docs/src/content/docs/concepts/qa.md`: where a QA run's intent co
 budget, and the one honest limit left - with `commands.lint` unset, lint's normal pass still applies and
 commits safe fixes in the disposable worktree, so a read-only run's lint findings describe the code after
 those fixes. The real fix is the deferred `sctx.ReadOnly` flag suppressing `commitAgentFixes`.
+
+### Deviations recorded while implementing S17
+
+1. **The S8 `file://` constraint never needed resolving.** The plan reserved a decision for S11/S17 about
+   making a filesystem remote fetchable. It is unnecessary: `RemoteIdentity` only runs at REGISTRATION, and
+   `AssertConnectedGateURLBinding` compares a redacted gate origin to the stored URL, which a plain path
+   satisfies. Tests insert the connected row directly (as S3's guard tests do) and use a real bare repo as
+   the remote, so every fetch path is exercised without a network or a scheme-qualified URL.
+2. **A QA run's base is a first-class input, not only a derivation.** `QARunRequest.BaseSHA` exists so S19
+   can pass `watch_state.last_seen_sha` and have a sweep review exactly what arrived since. When it is empty:
+   the merge-base with the default branch on a non-default branch, and the previous commit on the default
+   branch itself, so a manual run on `main` validates the newest change rather than the entire repository.
+   A root commit yields no base and the steps fall back to their own resolution.
+3. **QA refuses a LOCAL repository**, which the plan never stated explicitly. It is the mirror image of S3:
+   author surfaces refuse connected repositories, and QA refuses local ones. A QA run against someone's own
+   clone would take the branch lock on a branch they are working on and show up in their own status, which
+   is exactly what `concepts/qa.md` promises never happens.
+4. **The branch is fetched to `refs/heads/<branch>` in the gate.** A connected gate receives no pushes, so
+   the commits have to arrive somehow, and landing them where a pushed branch would be keeps every later
+   step (rebase's origin comparison, PR discovery by branch) behaving exactly as it does for a gate run.
+   Invariant C1 is asserted BEFORE the fetch: a drifted gate may name a different repository, and fetching
+   from it would pull that repository's commits into this one's gate.
+5. **`--mode` defaults to `report`, not to `qa.default_mode`.** That key is documented as what a *watch*
+   inherits, and a command a person just typed should not silently pick up a mode configured for unattended
+   work.
+6. **`--repo` landed on `runs` only**, not on `status`, `rerun`, `axi status`, `axi logs`, and `axi abort` as
+   the plan listed. `runs` is a pure row read, so an explicitly named connected repository is answerable.
+   `status` mixes in local-branch custody state that has no meaning without a checkout, so it needs its own
+   connected rendering - which is `qa status` (S20), not a flag here. `rerun` and `axi abort` are author-side
+   mutations tied to a checkout: reaching a connected repository through them would start a GATE-kind run on
+   a repository with no author, and `qa run` is the operator's entry point for that.
+7. **`inspectGateContext` is a new test seam** in `internal/daemon/daemon.go`. `internal/gatecontext` remains
+   the single classifier; the indirection exists so a test can force the nested verdict without reproducing
+   a live gate step's process ancestry, which is what makes `TestQAMutationsRefuseNestedGateContext` a
+   behavioural test through the real IPC server rather than a source-text check.
+8. **`ApplyQAConfig` is wired at daemon startup**, so `qa.max_concurrent` and `qa.max_total_runs` are in
+   force rather than the constructor's conservative defaults. The rest of the `qa` block still waits for the
+   watcher (S19-S20).
+
+`docs/src/content/docs/reference/cli.md` gained the `repos` and `qa run` sections (`repos` had never been
+documented there - S10 debt, closed now) and the `runs --repo` flag.
 
 ---
 
@@ -1075,10 +1086,13 @@ report-mode rebase-conflict test in `internal/qa/policy_test.go`.
 `TestSkippedDocumentStepFallsBackToLintOwnAgentPass`, `TestQARunIntentIsCommitDerivedAndNonAuthoritative`,
 `TestQARunNeverScansLocalTranscripts`, `TestReportModeApprovesRebaseConflictAndValidatesUnrebasedHead`.
 
-**S17 — `StartQARun` + `qa run`** · *depends: S11, S13, S16* `↳`
+**S17 ✅ `StartQARun` + `qa run`** · *depends: S11, S13, S16* `↳`
 `StartQARun`, `qa_run` IPC through `refuseNested`, the CLI command with the `--mode fix-pr` consent line
-requiring `--yes`, `resolveRepo` + `--repo` on the existing surfaces.
-*Done when:* `no-mistakes qa run --repo x --mode report` completes and its findings are in the DB.
+requiring `--yes`, `resolveRepo`, and `--repo` on `runs`.
+*Done:* `TestStartQARunRecordsItsScopeFindingsAndCommitIntent` drives a QA run to completion against a local
+bare "remote" and asserts its findings are in the database. Tests live in `internal/daemon/qarun_test.go`,
+`internal/daemon/qaingress_test.go`, `internal/daemon/gate_scope_preserved_test.go`, and
+`internal/cli/qa_test.go`.
 *Tests:* `TestQAMutationsRefuseNestedGateContext`, `TestPushReceivedIgnoresRepoQAModeAndRunsAllNineSteps`,
 `TestReportModeApproveKeepsStepFindingsAndRoundIntact`, `TestReportModeNeverStartsAFixRound`.
 
