@@ -71,8 +71,13 @@ func TestEnsureConnectedRegistersAndIsIdempotent(t *testing.T) {
 	if repo.DefaultBranch != "main" {
 		t.Errorf("DefaultBranch = %q, want the explicitly configured main", repo.DefaultBranch)
 	}
-	if repo.WorkingPath != e.p.SourceDir(repo.ID) {
-		t.Errorf("WorkingPath = %q, want the identity stub %q", repo.WorkingPath, e.p.SourceDir(repo.ID))
+	// The stub path is stored symlink-resolved, because every path-keyed lookup
+	// resolves before it asks (git reports a resolved root). Comparing against
+	// the unresolved path passed on Linux and failed on macOS, where every temp
+	// dir is a symlink - which is the bug this now pins the fix for.
+	wantStub := resolvePathForCompare(e.p.SourceDir(repo.ID))
+	if repo.WorkingPath != wantStub {
+		t.Errorf("WorkingPath = %q, want the resolved identity stub %q", repo.WorkingPath, wantStub)
 	}
 	if _, err := os.Stat(filepath.Join(e.p.RepoDir(repo.ID), "HEAD")); err != nil {
 		t.Errorf("bare gate was not provisioned: %v", err)
@@ -313,4 +318,50 @@ func mustRunGitOut(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %s: %v", strings.Join(args, " "), err)
 	}
 	return out
+}
+
+// TestEnsureConnectedStoresAStubPathEveryLookupCanFind is the platform-neutral
+// half of the macOS regression: registration under a state root reached through
+// a symlink must store the path git will report, not the aliased one it was
+// handed. Without it, GetRepoByPath never matches, and every author-side guard
+// degrades from "this is a connected repository" to "repo not initialized".
+func TestEnsureConnectedStoresAStubPathEveryLookupCanFind(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	p := paths.WithRoot(filepath.Join(alias, "state"))
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	env := &connectedEnv{p: p, db: database, remote: "https://example.test/acme/api.git"}
+
+	repo, err := EnsureConnected(context.Background(), env.db, env.p, env.spec("acme-api"))
+	if err != nil {
+		t.Fatalf("EnsureConnected: %v", err)
+	}
+
+	resolvedStub := resolvePathForCompare(p.SourceDir(repo.ID))
+	if repo.WorkingPath != resolvedStub {
+		t.Fatalf("WorkingPath = %q, want the resolved stub %q", repo.WorkingPath, resolvedStub)
+	}
+	// The lookup every author-side surface performs, with the path git reports.
+	found, err := database.GetRepoByPath(resolvedStub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found == nil || found.ID != repo.ID {
+		t.Fatalf("GetRepoByPath(%q) = %+v, want the registered repository", resolvedStub, found)
+	}
 }
