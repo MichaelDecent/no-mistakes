@@ -67,6 +67,41 @@ func (p *Paths) RepoDir(repoID string) string {
 	return filepath.Join(p.root, "repos", repoID+".git")
 }
 
+// SourcesDir holds the daemon-owned identity stubs for connected repositories.
+func (p *Paths) SourcesDir() string { return filepath.Join(p.root, "sources") }
+
+// SourceDir is a connected repository's identity stub.
+//
+// It is deliberately NOT a clone: the objects live in the bare gate (RepoDir).
+// It exists for two reasons. First, repos.working_path is NOT NULL UNIQUE, and
+// SQLite cannot drop NOT NULL under this project's additive-only migration
+// style, so a connected repository needs some unique daemon-owned path there.
+// Second, git.CopyLocalUserIdentity reads user.name and user.email from that
+// path for every run worktree, so there has to be a real git repository holding
+// a commit identity.
+//
+// Pointing working_path at the bare gate instead would be unsound: the URL
+// refresh path reads origin from working_path, and the gate's origin carries the
+// FULL credentialled URL by design, so it would be persisted into the database
+// and destroy the redaction invariant.
+func (p *Paths) SourceDir(repoID string) string {
+	return filepath.Join(p.root, "sources", repoID)
+}
+
+// QAReportsDir holds durable QA reports.
+//
+// Unlike test evidence, whose root is under the OS temporary directory because
+// the pull request body is the durable record, a QA report is the only record an
+// unattended sweep produces, so it lives under the application root. Like
+// EvalDir, EnsureDirs leaves creation to the reporter so disabling QA creates no
+// state.
+func (p *Paths) QAReportsDir() string { return filepath.Join(p.root, "qa-reports") }
+
+// QARunReportDir holds one run's QA report artifacts.
+func (p *Paths) QARunReportDir(runID string) string {
+	return filepath.Join(p.root, "qa-reports", runID)
+}
+
 func (p *Paths) WorktreesDir() string { return filepath.Join(p.root, "worktrees") }
 func (p *Paths) WorktreeDir(repoID, runID string) string {
 	return filepath.Join(p.root, "worktrees", repoID, runID)
@@ -100,6 +135,7 @@ func (p *Paths) EnsureDirs() error {
 	dirs := []string{
 		p.root,
 		p.ReposDir(),
+		p.SourcesDir(),
 		p.WorktreesDir(),
 		p.LogsDir(),
 		p.ServerPIDsDir(),

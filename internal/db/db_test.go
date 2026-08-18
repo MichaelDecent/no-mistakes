@@ -192,7 +192,7 @@ func TestOpenMigratesExistingStepRoundsColumns(t *testing.T) {
 		t.Fatalf("iterate table_info: %v", err)
 	}
 
-	for _, name := range []string{"selected_finding_ids", "selection_source", "fix_summary", "reviewed_head_sha"} {
+	for _, name := range []string{"selected_finding_ids", "selection_source", "fix_summary", "reviewed_head_sha", "gate_action", "gate_action_source", "gate_action_reason"} {
 		if !columns[name] {
 			t.Fatalf("expected migrated column %q to exist", name)
 		}

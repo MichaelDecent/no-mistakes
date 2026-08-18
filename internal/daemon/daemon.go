@@ -18,6 +18,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/gate"
 	"github.com/kunchenguid/no-mistakes/internal/gatecontext"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
@@ -201,6 +202,13 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, stepFactory StepFactory, sta
 	defer agent.SetServerPIDsDir("")
 
 	mgr := NewRunManager(d, p, stepFactory)
+	// Size the run slots from the operator's qa block before anything can be
+	// admitted. Best effort: an unreadable config already failed the startup
+	// path above, and a manager that keeps its conservative defaults still
+	// counts interactive runs correctly.
+	if qaCfg, cfgErr := config.LoadGlobal(p.ConfigFile()); cfgErr == nil {
+		mgr.ApplyQAConfig(qaCfg.QA)
+	}
 
 	// Publish process identity as soon as the singleton lock is held. Startup
 	// callers can now distinguish a launched child from IPC readiness and detect
@@ -363,6 +371,15 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager) {
 	orphanStarted := time.Now()
 	reapOrphanedServers(p)
 	logStartupPhase("orphan_servers", orphanStarted)
+
+	// Reconcile the operator's declared inventory BEFORE gate migration, so a
+	// newly declared repository's gate exists by the time migration walks every
+	// directory under ReposDir and stamps its config version. Best effort: a
+	// reconcile failure must never stop the daemon from serving the gates it
+	// already has.
+	reconcileStarted := time.Now()
+	reconcileConnectedOnStartup(context.Background(), d, p)
+	logStartupPhase("connected_reconcile", reconcileStarted)
 
 	gateStarted := time.Now()
 	gateStats := migrateGateConfigs(context.Background(), d, p)
@@ -615,15 +632,23 @@ func migrateGateConfig(ctx context.Context, bareDir string) error {
 	return nil
 }
 
+// inspectGateContext is the one classification call every ingress makes.
+// internal/gatecontext remains the single classifier; this indirection exists so
+// a test can force the nested verdict without reproducing a live gate step's
+// process ancestry, and nothing in production replaces it.
+var inspectGateContext = func(ctx context.Context, d *db.DB, p *paths.Paths, cwd string, markerPresent, skipManagedGit bool) (gatecontext.Result, error) {
+	return (gatecontext.Inspector{DB: d, Paths: p}).Inspect(ctx, gatecontext.Request{
+		CWD:            cwd,
+		PeerPID:        ipc.PeerPID(ctx),
+		DaemonPID:      os.Getpid(),
+		MarkerPresent:  markerPresent,
+		SkipManagedGit: skipManagedGit,
+	})
+}
+
 func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func()) {
 	classify := func(ctx context.Context, cwd string, markerPresent, skipManagedGit bool) (gatecontext.Result, error) {
-		return (gatecontext.Inspector{DB: d, Paths: mgr.paths}).Inspect(ctx, gatecontext.Request{
-			CWD:            cwd,
-			PeerPID:        ipc.PeerPID(ctx),
-			DaemonPID:      os.Getpid(),
-			MarkerPresent:  markerPresent,
-			SkipManagedGit: skipManagedGit,
-		})
+		return inspectGateContext(ctx, d, mgr.paths, cwd, markerPresent, skipManagedGit)
 	}
 	refuseNested := func(ctx context.Context, skipManagedGit bool) error {
 		result, err := classify(ctx, "", false, skipManagedGit)
@@ -787,6 +812,29 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 			return nil, err
 		}
 		return &ipc.RerunResult{RunID: runID}, nil
+	})
+
+	// A QA run is a mutation, so it goes through the same nested refusal as
+	// rerun: a gate step running inside a pipeline must not be able to start QA
+	// work recursively.
+	srv.Handle(ipc.MethodQARun, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		if err := refuseNested(ctx, false); err != nil {
+			return nil, err
+		}
+		var p ipc.QARunParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		runID, err := mgr.StartQARun(ctx, QARunRequest{
+			RepoID:  p.RepoID,
+			Branch:  p.Branch,
+			Mode:    p.Mode,
+			BaseSHA: p.BaseSHA,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &ipc.QARunResult{RunID: runID}, nil
 	})
 
 	srv.Handle(ipc.MethodPushReceived, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
@@ -965,4 +1013,55 @@ func stepToInfo(d *db.DB, s *db.StepResult) ipc.StepResultInfo {
 		info.PendingFixSource = rounds.PendingFixSource
 	}
 	return info
+}
+
+// reconcileConnectedOnStartup brings connected-repository registrations in line
+// with config.yaml as the daemon comes up, so an operator who edits the file and
+// restarts does not also have to remember `no-mistakes repos reconcile`.
+//
+// Every failure is logged and swallowed. A malformed entry, an unreachable
+// remote, or an unreadable config must never stop the daemon from serving the
+// gates it already has - a local developer's push does not depend on any of it.
+func reconcileConnectedOnStartup(ctx context.Context, d *db.DB, p *paths.Paths) {
+	globalCfg, err := config.LoadGlobal(p.ConfigFile())
+	if err != nil {
+		slog.Warn("connected reconcile skipped: global config unreadable", "error", err)
+		return
+	}
+	if len(globalCfg.Repos) == 0 {
+		// Still run it: an emptied `repos:` block is how an operator detaches
+		// everything, and detaching keeps records rather than deleting them.
+		if !hasConnectedRepos(d) {
+			return
+		}
+	}
+	result, err := gate.ReconcileConnected(ctx, d, p, globalCfg.Repos)
+	if err != nil {
+		slog.Warn("connected reconcile failed", "error", err)
+		return
+	}
+	for name, failure := range result.Failed {
+		slog.Warn("connected repository not reconciled", "repo", name, "error", failure)
+	}
+	if len(result.Registered)+len(result.Refreshed)+len(result.Detached) > 0 {
+		slog.Info("connected repositories reconciled",
+			"registered", len(result.Registered),
+			"refreshed", len(result.Refreshed),
+			"detached", len(result.Detached),
+			"failed", len(result.Failed),
+		)
+	}
+}
+
+func hasConnectedRepos(d *db.DB) bool {
+	repos, err := d.GetRepos()
+	if err != nil {
+		return false
+	}
+	for _, repo := range repos {
+		if repo.Connected() {
+			return true
+		}
+	}
+	return false
 }

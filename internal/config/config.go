@@ -11,11 +11,13 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/evidence"
+	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 	"github.com/kunchenguid/no-mistakes/internal/winproc"
 	"gopkg.in/yaml.v3"
@@ -99,27 +101,179 @@ type GlobalConfig struct {
 	// record replay provenance), never a repository policy. Keeping it out of
 	// RepoConfig means no pushed branch can enable, disable, or resize it.
 	Eval Eval
+	// Repos is the operator's declarative inventory of connected repositories,
+	// keyed by the operator-chosen name. It is global-only for the same reason
+	// as Eval, only more sharply: each entry names a repository this daemon will
+	// fetch, provision a gate for, and run agents against, so a pushed branch
+	// that could declare one would make a repository register itself.
+	//
+	// It is deliberately absent from Config: a run acts on exactly one
+	// repository and never needs the operator's whole inventory.
+	Repos map[string]RepoSpec
+	// QA is this machine's unattended-validation policy: scheduling,
+	// concurrency, retention, and whether findings may be published to a forge.
+	// Global-only for the same reason as Eval - it describes what this daemon
+	// does, not what a repository wants - and copied onto Config by Merge so a
+	// run can read the mode and limits it is operating under.
+	QA QA
+}
+
+// QARaw is the YAML representation of unattended-validation settings. Pointer
+// fields distinguish "not set" (nil) from explicit zero/false values, so an
+// operator writing `enabled: false` is not overwritten by a default.
+type QARaw struct {
+	Enabled        *bool   `yaml:"enabled"`
+	PollInterval   string  `yaml:"poll_interval"`
+	NightlyAt      *string `yaml:"nightly_at"`
+	MaxConcurrent  *int    `yaml:"max_concurrent"`
+	MaxTotalRuns   *int    `yaml:"max_total_runs"`
+	QueueDepth     *int    `yaml:"queue_depth"`
+	MaxRunDuration string  `yaml:"max_run_duration"`
+	MaxReports     *int    `yaml:"max_reports"`
+	DefaultMode    string  `yaml:"default_mode"`
+	Comment        *bool   `yaml:"comment"`
+}
+
+// QA is the resolved unattended-validation policy.
+//
+// Every default is deliberately inert: Enabled is false, so a daemon that has
+// never been configured does nothing unattended, and Comment is false, so a
+// forge write needs this switch AND a watch in comment mode - two independent
+// opt-ins for the one action that is visible to people outside this machine.
+type QA struct {
+	Enabled bool
+	// PollInterval is how often watched refs are re-examined. It pairs with
+	// NightlyAt; the two share one timer rather than each owning a ticker.
+	PollInterval time.Duration
+	// NightlyAt is an optional "HH:MM" local-time daily anchor. Empty means
+	// interval polling only.
+	NightlyAt string
+	// MaxConcurrent bounds QA runs in flight. Interactive runs (a push, a rerun,
+	// a crash-recovery resume) count toward the totals but are never gated by
+	// them, so validation never holds an author hostage.
+	MaxConcurrent int
+	MaxTotalRuns  int
+	QueueDepth    int
+	// MaxRunDuration is the watcher-side backstop that cancels a QA run which
+	// has outlived any useful result.
+	MaxRunDuration time.Duration
+	// MaxReports caps retained QA reports, pruned oldest-first and never
+	// removing a report whose run is still active.
+	MaxReports int
+	// DefaultMode is the mode a watch inherits when it declares none. It can
+	// never be a code-writing mode: see validateQARaw.
+	DefaultMode types.RunMode
+	// Comment is the global half of the two opt-ins a forge comment requires.
+	Comment bool
+}
+
+// RepoSpecRaw is the YAML representation of one connected-repository entry.
+type RepoSpecRaw struct {
+	URL           string `yaml:"url"`
+	CredentialEnv string `yaml:"credential_env"`
+	DefaultBranch string `yaml:"default_branch"`
+	CommitName    string `yaml:"commit_name"`
+	CommitEmail   string `yaml:"commit_email"`
+	// DisableProjectSettings is the operator's floor, applied as
+	// effective = trustedRepoValue OR floor. A plain bool rather than a pointer
+	// on purpose: absent and false are structurally the same no-op, and no YAML
+	// value may clear a repository's own trusted true.
+	DisableProjectSettings bool `yaml:"disable_project_settings"`
+	// AllowProjectInstructions lowers the connected-repository DEFAULT that
+	// turns DisableProjectSettings on. It exists because with the floor on and
+	// EnsureGateNeutralized failing closed, only agents with a verified
+	// suppression knob can launch, so an operator whose only agent lacks one
+	// would otherwise be unable to QA anything. It never clears a repository's
+	// own trusted true, and an explicit DisableProjectSettings still wins.
+	AllowProjectInstructions bool `yaml:"allow_project_instructions"`
+	// ForkURL is parsed only so a value can be REJECTED with a clear message
+	// rather than silently ignored by KnownFields. Fork routing is GitHub-parent
+	// plus GitHub-fork only (validateForkRouting) and is out of scope for
+	// connected repositories.
+	ForkURL string `yaml:"fork_url"`
+}
+
+// RepoSpec is one resolved connected-repository entry.
+//
+// URL keeps any credential it was written with: that is what authenticates the
+// fetch. Only GlobalConfig.SourceYAML - the copy that reaches SQLite and the
+// eval corpus - is redacted, and the stored repos.upstream_url is redacted
+// separately at registration.
+type RepoSpec struct {
+	Name          string
+	URL           string
+	CredentialEnv string
+	DefaultBranch string
+	CommitName    string
+	CommitEmail   string
+
+	DisableProjectSettings   bool
+	AllowProjectInstructions bool
+}
+
+// RepoPolicy is the operator's per-repository floor, applied on top of a
+// repository's own trusted configuration as effective = trustedRepoValue OR
+// floor.
+//
+// Every field is a plain bool rather than a pointer so that absent and false
+// are structurally the same no-op. That is what makes the floor monotone by
+// construction: there is no representable value that CLEARS a restriction a
+// repository set for itself, so no configuration mistake can weaken a
+// repository's own choice.
+type RepoPolicy struct {
+	DisableProjectSettings bool
+}
+
+// RepoPolicyFor resolves the operator floor for a repository by its
+// operator-chosen name. An unknown or empty name - which is every local
+// repository, since only connected repositories are declared - yields the zero
+// policy, so local behaviour is unchanged by construction.
+//
+// A declared connected repository defaults to DisableProjectSettings on: the
+// operator cannot edit a watched repository, so its AGENTS.md or CLAUDE.md is
+// untrusted input to the agent that will run against it. AllowProjectInstructions
+// lowers that default; an explicit DisableProjectSettings re-raises it, because
+// naming the restriction is a clearer signal of intent than opting out of a
+// default.
+func (g *GlobalConfig) RepoPolicyFor(name string) RepoPolicy {
+	if g == nil {
+		return RepoPolicy{}
+	}
+	spec, ok := g.Repos[strings.TrimSpace(name)]
+	if !ok {
+		return RepoPolicy{}
+	}
+	disable := true
+	if spec.AllowProjectInstructions {
+		disable = false
+	}
+	if spec.DisableProjectSettings {
+		disable = true
+	}
+	return RepoPolicy{DisableProjectSettings: disable}
 }
 
 // globalConfigRaw is the on-disk YAML representation with duration as string.
 type globalConfigRaw struct {
-	Agent                agentList           `yaml:"agent"`
-	ACPXPath             string              `yaml:"acpx_path"`
-	ACPRegistryOverrides map[string]string   `yaml:"acp_registry_overrides"`
-	AgentPathOverride    map[string]string   `yaml:"agent_path_override"`
-	AgentArgsOverride    map[string][]string `yaml:"agent_args_override"`
-	CITimeout            string              `yaml:"ci_timeout"`
-	DaemonConnectTimeout string              `yaml:"daemon_connect_timeout"`
-	BabysitTimeout       string              `yaml:"babysit_timeout"`
-	StepQuietWarning     string              `yaml:"step_quiet_warning"`
-	LogLevel             string              `yaml:"log_level"`
-	SessionReuse         *bool               `yaml:"session_reuse"`
-	AutoFix              AutoFixRaw          `yaml:"auto_fix"`
-	CI                   CIRaw               `yaml:"ci"`
-	Commit               CommitRaw           `yaml:"commit"`
-	Intent               IntentRaw           `yaml:"intent"`
-	Test                 TestRaw             `yaml:"test"`
-	Eval                 EvalRaw             `yaml:"eval"`
+	Agent                agentList              `yaml:"agent"`
+	ACPXPath             string                 `yaml:"acpx_path"`
+	ACPRegistryOverrides map[string]string      `yaml:"acp_registry_overrides"`
+	AgentPathOverride    map[string]string      `yaml:"agent_path_override"`
+	AgentArgsOverride    map[string][]string    `yaml:"agent_args_override"`
+	CITimeout            string                 `yaml:"ci_timeout"`
+	DaemonConnectTimeout string                 `yaml:"daemon_connect_timeout"`
+	BabysitTimeout       string                 `yaml:"babysit_timeout"`
+	StepQuietWarning     string                 `yaml:"step_quiet_warning"`
+	LogLevel             string                 `yaml:"log_level"`
+	SessionReuse         *bool                  `yaml:"session_reuse"`
+	AutoFix              AutoFixRaw             `yaml:"auto_fix"`
+	CI                   CIRaw                  `yaml:"ci"`
+	Commit               CommitRaw              `yaml:"commit"`
+	Intent               IntentRaw              `yaml:"intent"`
+	Test                 TestRaw                `yaml:"test"`
+	Eval                 EvalRaw                `yaml:"eval"`
+	Repos                map[string]RepoSpecRaw `yaml:"repos"`
+	QA                   QARaw                  `yaml:"qa"`
 }
 
 // RepoConfig represents .no-mistakes.yaml in a repo root.
@@ -402,6 +556,7 @@ type Config struct {
 	LogLevel              string
 	SessionReuse          bool
 	Eval                  Eval
+	QA                    QA
 	Commands              Commands
 	IgnorePatterns        []string
 	AutoFix               AutoFix
@@ -1194,6 +1349,7 @@ func DefaultGlobalConfig() *GlobalConfig {
 		LogLevel:             "info",
 		SessionReuse:         true,
 		Eval:                 evalDefaults(),
+		QA:                   qaDefaults(),
 	}
 }
 
@@ -1211,9 +1367,61 @@ func LoadGlobal(path string) (*GlobalConfig, error) {
 	return LoadGlobalFromBytes(data)
 }
 
+// credentialURLPattern finds a scheme-qualified URL carrying userinfo, in any
+// scheme, so a credential is caught wherever it appears in a configuration
+// document. It deliberately does not reuse safeurl's own pattern, which matches
+// only http and https: broadening that one would also rewrite the conventional,
+// non-secret "git@" user in ssh URLs inside every error message that already
+// flows through safeurl.RedactText, making diagnostics worse for no gain.
+//
+// The trailing character class stops at whitespace and at YAML quoting and
+// comment characters, so a quoted scalar keeps its quotes and a trailing comment
+// is not swallowed into the URL.
+var credentialURLPattern = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^\s/?#'"]*@[^\s'"#]+`)
+
+// RedactConfigSource removes credentials from configuration bytes before they are
+// stored anywhere.
+//
+// This exists because GlobalConfig.SourceYAML is not merely read: it is copied
+// into Config.ReplayGlobalYAML by EnableEvalProvenance, written to
+// step_rounds.global_config_yaml on every review round, and copied onto disk by
+// eval capture - and both eval.capture_provenance and eval.auto_capture default
+// to true. Connecting repositories by remote URL makes it ordinary for
+// configuration to name URLs, and operators embed tokens in URLs, so without this
+// one token in config.yaml would be persisted verbatim and repeatedly.
+//
+// Redaction is textual rather than a YAML round trip, so a document with no
+// credential is returned byte-for-byte unchanged: comments, key order, and
+// formatting all survive, and a real redaction stands out instead of hiding in a
+// wholesale rewrite. It also cannot fail, which matters on a path that must never
+// turn a loadable configuration into an unloadable one.
+//
+// It is deliberately not limited to the URL fields this project knows about. Any
+// scheme'd URL with userinfo anywhere in the document is redacted, because the
+// cost of over-redacting a value used only for replay provenance is nil and the
+// cost of missing one is a persisted secret.
+func RedactConfigSource(data []byte) []byte {
+	if len(data) == 0 {
+		return data
+	}
+	if !bytes.Contains(data, []byte("@")) {
+		// No userinfo is possible without an "@", so the overwhelmingly common
+		// case does no regexp work and returns the original slice.
+		return data
+	}
+	redacted := credentialURLPattern.ReplaceAllStringFunc(string(data), safeurl.Redact)
+	if redacted == string(data) {
+		return data
+	}
+	return []byte(redacted)
+}
+
 func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	cfg := DefaultGlobalConfig()
-	cfg.SourceYAML = append([]byte(nil), data...)
+	// Store redacted bytes, never the raw ones. See RedactConfigSource: these
+	// bytes reach SQLite and the on-disk eval corpus on every review round, so a
+	// credential must be removed here rather than at any later consumer.
+	cfg.SourceYAML = append([]byte(nil), RedactConfigSource(data)...)
 	var raw globalConfigRaw
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -1229,6 +1437,16 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	if err := validateEvalRaw(raw.Eval); err != nil {
 		return nil, fmt.Errorf("parse global config: %w", err)
 	}
+	repos, err := resolveReposRaw(raw.Repos)
+	if err != nil {
+		return nil, fmt.Errorf("parse global config: %w", err)
+	}
+	cfg.Repos = repos
+	qa, err := resolveQARaw(raw.QA)
+	if err != nil {
+		return nil, fmt.Errorf("parse global config: %w", err)
+	}
+	cfg.QA = qa
 
 	if len(raw.Agent) > 0 {
 		cfg.Agents = copyAgents(raw.Agent)
@@ -1625,6 +1843,178 @@ func applyEvalOverrides(dst *Eval, src *EvalRaw) {
 	}
 }
 
+// qaNightlyAtPattern matches an "HH:MM" 24-hour local-time anchor, accepting a
+// single-digit hour so "9:05" is not a surprise error.
+var qaNightlyAtPattern = regexp.MustCompile(`^([01]?[0-9]|2[0-3]):[0-5][0-9]$`)
+
+// qaDefaults are the resolved values before any operator override.
+//
+// Enabled is false so a daemon that has never been configured does nothing
+// unattended, and Comment is false so a forge write requires a second, explicit
+// opt-in. The concurrency numbers are reasoned rather than measured: each run
+// spawns agent CLI subprocesses that routinely hold 1-3 GB, every database write
+// serializes on a single connection, and this daemon has already been OOM-killed
+// in the field by leaked grandchildren, so a NEW source of concurrency starts
+// conservative and is revisited with real numbers from `qa status`.
+func qaDefaults() QA {
+	return QA{
+		Enabled:        false,
+		PollInterval:   15 * time.Minute,
+		MaxConcurrent:  2,
+		MaxTotalRuns:   4,
+		QueueDepth:     64,
+		MaxRunDuration: 6 * time.Hour,
+		MaxReports:     500,
+		DefaultMode:    types.RunModeReport,
+		Comment:        false,
+	}
+}
+
+// resolveQARaw validates the operator's QA policy and applies it onto defaults.
+func resolveQARaw(raw QARaw) (QA, error) {
+	qa := qaDefaults()
+	if raw.Enabled != nil {
+		qa.Enabled = *raw.Enabled
+	}
+	if raw.Comment != nil {
+		qa.Comment = *raw.Comment
+	}
+	if raw.NightlyAt != nil {
+		at := strings.TrimSpace(*raw.NightlyAt)
+		if at != "" && !qaNightlyAtPattern.MatchString(at) {
+			return QA{}, fmt.Errorf("qa.nightly_at %q is not an HH:MM 24-hour time", at)
+		}
+		qa.NightlyAt = at
+	}
+	if v := strings.TrimSpace(raw.PollInterval); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return QA{}, fmt.Errorf("parse qa.poll_interval %q: %w", v, err)
+		}
+		if d <= 0 {
+			return QA{}, fmt.Errorf("qa.poll_interval must be positive, got %q", v)
+		}
+		qa.PollInterval = d
+	}
+	if v := strings.TrimSpace(raw.MaxRunDuration); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return QA{}, fmt.Errorf("parse qa.max_run_duration %q: %w", v, err)
+		}
+		if d <= 0 {
+			return QA{}, fmt.Errorf("qa.max_run_duration must be positive, got %q", v)
+		}
+		qa.MaxRunDuration = d
+	}
+	// max_concurrent must be positive: zero dispatchers would accept work and
+	// never run it, which reads as a hang rather than as "QA is off".
+	if err := applyPositiveQACount("qa.max_concurrent", raw.MaxConcurrent, &qa.MaxConcurrent); err != nil {
+		return QA{}, err
+	}
+	// The remaining counts allow zero as a meaningful "unbounded/none" value but
+	// never a negative, which no consumer has a sensible reading for.
+	for _, field := range []struct {
+		name string
+		src  *int
+		dst  *int
+	}{
+		{"qa.max_total_runs", raw.MaxTotalRuns, &qa.MaxTotalRuns},
+		{"qa.queue_depth", raw.QueueDepth, &qa.QueueDepth},
+		{"qa.max_reports", raw.MaxReports, &qa.MaxReports},
+	} {
+		if field.src == nil {
+			continue
+		}
+		if *field.src < 0 {
+			return QA{}, fmt.Errorf("%s must not be negative, got %d", field.name, *field.src)
+		}
+		*field.dst = *field.src
+	}
+	if v := strings.TrimSpace(raw.DefaultMode); v != "" {
+		if !types.ValidRunMode(v) {
+			return QA{}, fmt.Errorf("qa.default_mode %q is not a valid mode", v)
+		}
+		mode := types.RunMode(v)
+		// A watch inherits this mode and fires with no human present, so a
+		// code-writing default is refused here rather than filtered later.
+		// fix-pr stays reachable only through an explicit, consented
+		// `qa run --mode fix-pr --yes`.
+		if mode.WritesCode() {
+			return QA{}, fmt.Errorf("qa.default_mode %q writes code, which an unattended run must never do; use %q or %q", mode, types.RunModeReport, types.RunModeComment)
+		}
+		qa.DefaultMode = mode
+	}
+	return qa, nil
+}
+
+func applyPositiveQACount(name string, src *int, dst *int) error {
+	if src == nil {
+		return nil
+	}
+	if *src <= 0 {
+		return fmt.Errorf("%s must be positive, got %d", name, *src)
+	}
+	*dst = *src
+	return nil
+}
+
+// connectedRepoNamePattern constrains an operator-chosen repository name.
+//
+// The name is user-facing (it selects a repository on the CLI) and reaches
+// display and log surfaces, so it is kept to a conservative, predictable
+// charset. It must begin with a letter or digit, which rules out "." and ".."
+// by construction and keeps a name from looking like a flag.
+//
+// The name never derives a repository ID - that comes from the remote identity
+// (gate.ConnectedRepoID) - but this rule is what makes it safe if a future
+// caller ever joins a name into a path.
+var connectedRepoNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+
+// resolveReposRaw validates and resolves the operator's connected-repository
+// inventory.
+//
+// It deliberately does NOT canonicalize URLs into remote identities, which is
+// what would detect two names pointing at the same repository. That
+// normalization has exactly one owner, gate.RemoteIdentity, and importing
+// internal/gate here would pull the agent, db, and scm trees into the
+// dependency graph of nearly every package. Registration resolves identity and
+// refuses collisions there, against the live database, which is also the only
+// place a collision can actually do harm. What is validated here is what config
+// can decide on its own: a usable name, and a URL that is present and free of
+// the whitespace and control characters every downstream parser rejects.
+func resolveReposRaw(raw map[string]RepoSpecRaw) (map[string]RepoSpec, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	resolved := make(map[string]RepoSpec, len(raw))
+	for name, spec := range raw {
+		if !connectedRepoNamePattern.MatchString(name) {
+			return nil, fmt.Errorf("repos: invalid name %q: use lowercase letters, digits, '.', '_' or '-', starting with a letter or digit", name)
+		}
+		url := strings.TrimSpace(spec.URL)
+		if url == "" {
+			return nil, fmt.Errorf("repos.%s: url is required", name)
+		}
+		if url != spec.URL || strings.IndexFunc(url, func(r rune) bool { return r <= ' ' || r == 0x7f }) >= 0 {
+			return nil, fmt.Errorf("repos.%s: url must not contain whitespace or control characters", name)
+		}
+		if strings.TrimSpace(spec.ForkURL) != "" {
+			return nil, fmt.Errorf("repos.%s: fork_url is not supported for connected repositories", name)
+		}
+		resolved[name] = RepoSpec{
+			Name:                     name,
+			URL:                      url,
+			CredentialEnv:            strings.TrimSpace(spec.CredentialEnv),
+			DefaultBranch:            strings.TrimSpace(spec.DefaultBranch),
+			CommitName:               strings.TrimSpace(spec.CommitName),
+			CommitEmail:              strings.TrimSpace(spec.CommitEmail),
+			DisableProjectSettings:   spec.DisableProjectSettings,
+			AllowProjectInstructions: spec.AllowProjectInstructions,
+		}
+	}
+	return resolved, nil
+}
+
 // validateEvalRaw fails the config closed on a negative eval.max_cases. A
 // negative cap has no defensible meaning here - it is neither "keep everything"
 // (0) nor a bound - so surfacing the typo beats guessing which one was meant.
@@ -1730,7 +2120,36 @@ func (c *Config) AutoFixLimit(step types.StepName) int {
 // Merge combines global and per-repo config. Per-repo agent values, including
 // ordered fallback lists, override global agent values when non-empty. Commands
 // and ignore patterns come from repo config only.
+//
+// Merge is exactly MergeWithRepoPolicy with an empty policy, which is what
+// keeps every existing caller's behaviour identical.
 func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
+	return MergeWithRepoPolicy(global, repo, RepoPolicy{})
+}
+
+// MergeWithRepoPolicy is Merge plus the operator's monotone floor.
+//
+// The floor is applied HERE, in the merge, rather than at the agent
+// construction site, because that is what makes it reach both a fresh run and a
+// crash-recovered one: both paths merge configuration, and only one of them
+// builds an agent from scratch. newPipelineAgent needs no change - it already
+// reads cfg.DisableProjectSettings for agent.Options and for the fail-closed
+// EnsureGateNeutralized check.
+//
+// EffectiveRepoConfig is deliberately untouched: disable_project_settings stays
+// trusted-only there, and this floor is a separate, later lift applied on top
+// of whatever trusted resolution already decided.
+func MergeWithRepoPolicy(global *GlobalConfig, repo *RepoConfig, policy RepoPolicy) *Config {
+	cfg := mergeConfig(global, repo)
+	// effective = trustedRepoValue OR operatorFloor. Never an assignment, which
+	// could lower a repository's own trusted true.
+	if policy.DisableProjectSettings {
+		cfg.DisableProjectSettings = true
+	}
+	return cfg
+}
+
+func mergeConfig(global *GlobalConfig, repo *RepoConfig) *Config {
 	af := autoFixDefaults()
 	applyAutoFixOverrides(&af, &global.AutoFix)
 	applyAutoFixOverrides(&af, &repo.AutoFix)
@@ -1770,9 +2189,12 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		StepQuietWarning:     global.StepQuietWarning,
 		LogLevel:             global.LogLevel,
 		SessionReuse:         global.SessionReuse,
-		// Eval is global-only by design (see GlobalConfig.Eval), so it is
-		// copied straight through with no repository override step.
+		// Eval and QA are global-only by design (see GlobalConfig.Eval and
+		// GlobalConfig.QA), so both are copied straight through with no
+		// repository override step. GlobalConfig.Repos is deliberately NOT
+		// copied: a run acts on one repository, never the whole inventory.
 		Eval:           global.Eval,
+		QA:             global.QA,
 		Commands:       repo.Commands,
 		IgnorePatterns: repo.IgnorePatterns,
 		AutoFix:        af,

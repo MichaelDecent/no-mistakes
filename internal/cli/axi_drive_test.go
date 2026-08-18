@@ -454,6 +454,54 @@ func TestGateResolution(t *testing.T) {
 	}
 }
 
+// TestGateResolutionDelegatesToTypesResolveConvergingGate is the drift check
+// that keeps the converging-gate judgement in exactly one place. The daemon's
+// unattended QA gate policy answers gates with types.ResolveConvergingGate; if
+// gateResolution ever grows its own copy of the rule, the two mechanisms judge
+// the same question differently and an attended --yes run stops agreeing with an
+// unattended one.
+func TestGateResolutionDelegatesToTypesResolveConvergingGate(t *testing.T) {
+	cases := []struct {
+		name         string
+		findingsJSON string
+		status       types.StepStatus
+		alreadyFixed bool
+	}{
+		{"actionable awaiting", `{"findings":[{"id":"a-1","severity":"warning","description":"x","action":"ask-user"}]}`, types.StepStatusAwaitingApproval, false},
+		{"actionable already fixed", `{"findings":[{"id":"a-1","severity":"warning","description":"x","action":"ask-user"}]}`, types.StepStatusAwaitingApproval, true},
+		{"actionable in fix review", `{"findings":[{"id":"a-1","severity":"warning","description":"x","action":"ask-user"}]}`, types.StepStatusFixReview, false},
+		{"only no-op", `{"findings":[{"id":"a-1","severity":"info","description":"x","action":"no-op"}]}`, types.StepStatusAwaitingApproval, false},
+		{"no findings", `{"findings":[]}`, types.StepStatusAwaitingApproval, false},
+		{"actionable without ids", `{"findings":[{"severity":"warning","description":"x","action":"ask-user"}]}`, types.StepStatusAwaitingApproval, false},
+		{"empty action defaults to ask-user", `{"findings":[{"id":"a-1","severity":"warning","description":"x"}]}`, types.StepStatusAwaitingApproval, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gate := stepView{Name: "review", Status: string(tc.status), FindingsJSON: tc.findingsJSON}
+			gotAction, gotIDs := gateResolution(gate, tc.alreadyFixed)
+
+			parsed, err := types.ParseFindingsJSON(tc.findingsJSON)
+			if err != nil {
+				t.Fatalf("parse findings: %v", err)
+			}
+			wantAction, wantIDs := types.ResolveConvergingGate(parsed, tc.alreadyFixed, tc.status == types.StepStatusFixReview)
+
+			if gotAction != wantAction {
+				t.Errorf("gateResolution action = %s, types.ResolveConvergingGate = %s", gotAction, wantAction)
+			}
+			if len(gotIDs) != len(wantIDs) {
+				t.Fatalf("gateResolution ids = %v, types.ResolveConvergingGate = %v", gotIDs, wantIDs)
+			}
+			for i := range gotIDs {
+				if gotIDs[i] != wantIDs[i] {
+					t.Errorf("gateResolution ids = %v, types.ResolveConvergingGate = %v", gotIDs, wantIDs)
+				}
+			}
+		})
+	}
+}
+
 func TestRenderDriveResult_ChecksPassed(t *testing.T) {
 	run := &ipc.RunInfo{
 		ID:      "run-1",

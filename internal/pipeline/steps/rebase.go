@@ -186,6 +186,14 @@ func detectBundledLocalDefaultCommits(ctx context.Context, sctx *pipeline.StepCo
 	if branch == "" || branch == defaultBranch {
 		return nil
 	}
+	// A connected repository has no developer checkout, so there is no local
+	// default branch that could bundle another workstream's unpushed work. Its
+	// WorkingPath is a refless identity stub, which would read as "no local
+	// default tip" anyway - but this finding is blocking and not auto-fixable,
+	// so it must not depend on the stub staying refless.
+	if sctx.Repo.Connected() {
+		return nil
+	}
 	workingPath := strings.TrimSpace(sctx.Repo.WorkingPath)
 	if workingPath == "" {
 		return nil

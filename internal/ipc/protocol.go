@@ -19,6 +19,7 @@ const (
 	MethodSubscribe      = "subscribe"
 	MethodRespond        = "respond"
 	MethodCancelRun      = "cancel_run"
+	MethodQARun          = "qa_run"
 	MethodGateContext    = "gate_context"
 	MethodAdmitPush      = "admit_push"
 	MethodHealth         = "health"
@@ -175,6 +176,15 @@ type HealthParams struct{}
 // ShutdownParams has no fields but exists for consistency.
 type ShutdownParams struct{}
 
+// QARunParams starts one QA run against a connected repository. Mode is
+// required: what a run may do with what it finds is never implied.
+type QARunParams struct {
+	RepoID  string        `json:"repo_id"`
+	Branch  string        `json:"branch,omitempty"`
+	Mode    types.RunMode `json:"mode"`
+	BaseSHA string        `json:"base_sha,omitempty"`
+}
+
 // --- Method results ---
 
 // PushReceivedResult confirms the push was accepted.
@@ -198,6 +208,11 @@ type GetActiveRunResult struct {
 }
 
 // RerunResult confirms a rerun was created.
+// QARunResult carries the started run's ID.
+type QARunResult struct {
+	RunID string `json:"run_id"`
+}
+
 type RerunResult struct {
 	RunID string `json:"run_id"`
 }

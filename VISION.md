@@ -10,9 +10,20 @@ The gate is opt-in and explicit: a named remote you push to on purpose, never a 
 Pushing through the gate is the consent boundary: it authorizes that run to validate, apply reviewable fixes, push the branch, and raise the PR, and nothing else implies that consent.
 "Passed the gate" must mean at least the same thing in every repo: the core pipeline's shape and order stay fixed, and a repository may add checks on top but never remove, reorder, or dilute the core.
 Customization is welcome exactly as far as it strengthens what a pass means; no durable configuration, and no classifier's guess about a change's riskiness, may quietly weaken it.
-A person may explicitly skip steps for one run; a standing rule may never skip them on anyone's behalf.
+A person may explicitly skip steps for one run; a standing rule may never skip them on anyone's behalf, and no configuration may reach a gate run's step set at all.
 A gate that cannot run completely refuses loudly with guidance; it never degrades silently into a weaker check.
 Efficiency never buys itself a skipped check: when a shortcut fails, the gate falls back to the slower correct path instead of skipping the validation.
+
+## Two scopes, one standard
+
+The product has two scopes, and they are not equals.
+The gate is the first and the primary one: author-initiated, consented by a deliberate push, and everything said about it here holds without exception.
+Quality assurance is the second: an operator declares repositories they are accountable for, and the tool validates them without a developer checkout and without a push to trigger it.
+QA needs its own, narrower consent boundary precisely because it has no push to carry one: declarative configuration the operator wrote authorizes validating those repositories and publishing findings about them, and nothing beyond that.
+An unattended run never writes code, and a mode that would is reachable only by an explicit per-run request from a person who is present.
+QA is opt-in and off until configured, so it never becomes the always-on service nobody asked for.
+The gate's invariants are never relaxed to serve QA: a repository's QA policy cannot reach a gate run's step set, and pushing to a repository always yields the full gate no matter how that repository is configured for QA.
+Where QA is narrower than the gate it is narrower only in what it is permitted to do, never in what a pass is allowed to mean.
 
 ## Never lose work
 
@@ -61,8 +72,9 @@ No forge, host, or provider is privileged in the product's identity; breadth sti
 
 ## Scope and evaluation
 
-no-mistakes is a local tool for the person whose credentials and accountability are on the line; runs happen on their machine, under their identity, at their initiative.
+no-mistakes is a local tool for the person whose credentials and accountability are on the line; runs happen on their machine, under their identity, and at their initiative or on a schedule they configured for repositories they declared.
 It is not a CI system, not an agent orchestrator, not a code host, and not a team-governance platform; CI stays the shared outer gate, and merge policy belongs to the provider.
+Validating declared repositories on a schedule does not make it one: it reports findings to the people accountable for them and never becomes the authority that decides whether a change may merge.
 Where a repository genuinely has no outer gate, the inner gate may take on more of that duty by the user's explicit choice.
 The gate assumes as little as possible about what a repository contains: code or not, a change is a change, and the gate's question is always whether it is safe to share.
 Every change to this repository must pass through its own gate; dogfooding is the first calibration loop, and field incidents become regression tests before they become memories.

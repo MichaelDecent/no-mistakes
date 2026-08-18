@@ -23,6 +23,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps"
 	"github.com/kunchenguid/no-mistakes/internal/procreap"
+	"github.com/kunchenguid/no-mistakes/internal/qa"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -47,7 +48,14 @@ type RunManager struct {
 	paths        *paths.Paths
 	steps        StepFactory
 
-	branchLocks sync.Map // repoID+"/"+branch → *sync.Mutex
+	// branchLocks serializes run starts per repository+branch. It is refcounted
+	// and self-pruning: a bare sync.Map never removed a key, which a QA sweep over
+	// many repositories times many refs would grow without ceiling.
+	branchLocks *branchLockSet
+
+	// slots bounds concurrent work. Interactive runs are counted but never gated;
+	// QA runs are capped and yield. See runSlots.
+	slots *runSlots
 
 	// evalCaptureMu serializes automatic eval collection. Concurrent runs
 	// finishing together would otherwise write the same per-repository object
@@ -88,7 +96,28 @@ func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *Ru
 		subscribers:   make(map[string][]*eventMailbox),
 		stateRevs:     make(map[string]int64),
 		completedRuns: make(map[string]bool),
+		branchLocks:   newBranchLockSet(),
+		// Defaults until the operator's qa block is applied. A manager that never
+		// serves QA work still needs a non-nil slots to count interactive runs.
+		slots: newRunSlots(2, 4),
 	}
+}
+
+// gatePolicyForRun is the one place a run's stored kind and mode become a gate
+// policy, used by both the start path and crash recovery so a resumed run cannot
+// be answered differently from how it started.
+//
+// Reading through the normalizers is deliberate: they are the single owner of
+// what a stored value means, so this function cannot develop its own opinion
+// about a NULL or unrecognized column. Every run the push path creates is a gate
+// run, so this returns nil there and the author-side gate keeps blocking for the
+// person who pushed.
+func gatePolicyForRun(run *db.Run) pipeline.GatePolicy {
+	if run == nil {
+		return nil
+	}
+	scope := runScopeFromRun(run)
+	return qa.PolicyFor(scope.kind, scope.mode)
 }
 
 type recoveredRunPlan struct {
@@ -232,14 +261,26 @@ func (m *RunManager) loadRecoveredConfig(ctx context.Context, run *db.Run, repo 
 	trustedRepoCfg := loadTrustedRepoConfig(ctx, workDir, trustedSHA, run.ID)
 	allowRepoCommands := trustedRepoCfg != nil && trustedRepoCfg.AllowRepoCommands
 	effectiveRepoCfg := config.EffectiveRepoConfig(repoCfg, trustedRepoCfg, allowRepoCommands)
-	cfg := config.Merge(globalCfg, effectiveRepoCfg)
+	cfg := config.MergeWithRepoPolicy(globalCfg, effectiveRepoCfg, globalCfg.RepoPolicyFor(repoPolicyKey(repo)))
 	cfg.TrustedConfigSHA = trustedSHA
+	cfg = applyRunScopeToConfig(cfg, runScopeFromRun(run))
 	if globalCfg.Eval.CaptureProvenance {
 		if err := cfg.EnableEvalProvenance(globalCfg, effectiveRepoCfg); err != nil {
 			return nil, err
 		}
 	}
 	return cfg, nil
+}
+
+// repoPolicyKey is the name an operator floor is looked up by. Only connected
+// repositories are declared in configuration, so a local repository yields an
+// empty key and therefore the zero policy - which is what keeps the local path
+// byte-identical to its pre-floor behaviour.
+func repoPolicyKey(repo *db.Repo) string {
+	if repo == nil || !repo.Connected() {
+		return ""
+	}
+	return repo.SourceName
 }
 
 func newPipelineAgent(ctx context.Context, cfg *config.Config, lookPath func(string) (string, error)) (agent.Agent, error) {
@@ -313,6 +354,16 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 	}
 	runCtx, cancel := context.WithCancelCause(context.Background())
 	executor := pipeline.NewExecutor(m.db, m.paths, plan.cfg, plan.agent, plan.steps, m.broadcast)
+	// A resumed run must be answered - and bounded - the same way it was before
+	// the crash, so both the policy and the skip declaration are reinstalled from
+	// the run's own row rather than inferred from anything about the recovery
+	// path. Without the skips, a read-only run would resume into the steps that
+	// push a branch and open a PR.
+	executor.SetGatePolicy(gatePolicyForRun(plan.run))
+	executor.SetSkippedSteps(plan.run.SkippedStepNames())
+	// A crash-recovery resume is interactive work: counted against the ceiling
+	// QA respects, never refused.
+	releaseSlot := m.slots.AcquireInteractive()
 	done := make(chan struct{})
 	m.mu.Lock()
 	m.executors[plan.run.ID] = executor
@@ -325,6 +376,7 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 		startedAt := time.Now()
 		defer m.wg.Done()
 		defer close(done)
+		defer releaseSlot()
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				errMsg := fmt.Sprintf("internal panic: %v", recovered)
@@ -703,7 +755,9 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 		}
 	}
 
-	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource)
+	// A rerun of any run is an author-side gate run: a person asked for it at a
+	// terminal, which is the same consent boundary as a push.
+	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource, gateRunScope())
 }
 
 // fetchRunDefaultBranch fetches the trusted branch from the refreshed
@@ -724,13 +778,13 @@ func fetchRunDefaultBranch(ctx context.Context, workDir string, repo *db.Repo) e
 // A non-empty intent is stamped onto the run as agent-supplied, so the intent
 // step uses it instead of inferring from transcripts.
 func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent string) (string, error) {
-	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, db.RunIntentSourceAgent)
+	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, db.RunIntentSourceAgent, gateRunScope())
 }
 
 // startRunWithIntentSource is the common run-creation path. source is empty
 // when no intent is supplied, RunIntentSourceAgent for a new explicit
 // override, and RunIntentSourceRerun for inherited explicit intent.
-func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source string) (string, error) {
+func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source string, scope runScope) (string, error) {
 	branchRole := telemetryBranchRole(branch, repo.DefaultBranch)
 	trackStartFailure := func(stage string) {
 		telemetry.Track("run", telemetry.Fields{
@@ -749,17 +803,64 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 	// Serialize per repo+branch to prevent two concurrent pushes from both
 	// passing cancelActiveRuns and creating duplicate pipelines.
 	lockKey := repo.ID + "/" + branch
-	lockVal, _ := m.branchLocks.LoadOrStore(lockKey, &sync.Mutex{})
-	branchMu := lockVal.(*sync.Mutex)
-	branchMu.Lock()
-	defer branchMu.Unlock()
+	releaseBranch := m.branchLocks.Acquire(lockKey)
+	defer releaseBranch()
 
-	// Best-effort only: a clone's remotes may change after init. Refresh the
-	// registered URLs before constructing any run-owned Git operation, but keep
-	// the exact prior repo value and continue when discovery, validation, or the
-	// atomic database replacement fails. The reason is deliberately bounded and
-	// URL-free so neither credentials nor sensitive remote material reach logs.
-	if refreshed, _, refreshErr := gate.RefreshRepoURLs(ctx, m.db, repo); refreshErr != nil {
+	// Admission, under the branch lock so the answer cannot race a concurrent
+	// start on the same branch.
+	//
+	// An interactive run - a push or a rerun - is counted but never refused:
+	// "validation must not hold the author hostage" is the product's core
+	// promise. QA work is capped and yields, because a declined QA item is
+	// re-derived by the next sweep while a declined push is simply lost.
+	var releaseSlot func()
+	if scope.isQA() {
+		// A QA run never supersedes an active gate run. The author's push is
+		// newer truth about that branch and it is the one with a person waiting.
+		if gateRunID, err := m.activeGateRunForBranch(repo.ID, branch); err != nil {
+			trackStartFailure("active_gate_lookup")
+			return "", err
+		} else if gateRunID != "" {
+			trackStartFailure("active_gate_run")
+			return "", fmt.Errorf("gate run %s is active for %s; QA declines the branch", gateRunID, branch)
+		}
+		release, admitted := m.slots.TryAcquireQA()
+		if !admitted {
+			trackStartFailure("qa_at_capacity")
+			return "", fmt.Errorf("QA run capacity reached; not starting a run for %s", branch)
+		}
+		releaseSlot = release
+	} else {
+		releaseSlot = m.slots.AcquireInteractive()
+	}
+	// The background goroutine takes the slot over once it launches; until then
+	// every early return must release it.
+	bgOwnsSlot := false
+	defer func() {
+		if !bgOwnsSlot {
+			releaseSlot()
+		}
+	}()
+
+	if repo.Connected() {
+		// SECURITY: deliberately NOT best-effort, unlike the local branch below.
+		//
+		// For a local repository the fallback is the operator's own stale row
+		// about their own clone, so continuing is safe. For a connected
+		// repository a stale or drifted row may name a DIFFERENT repository, and
+		// continuing could carve a worktree from a gate pointing somewhere this
+		// run was never authorized to touch. Invariant C1 is verified here,
+		// before any run-owned Git operation, and a mismatch fails the run.
+		if err := gate.AssertConnectedGateURLBinding(ctx, m.paths, repo); err != nil {
+			trackStartFailure("connected_binding")
+			return "", err
+		}
+	} else if refreshed, _, refreshErr := gate.RefreshRepoURLs(ctx, m.db, repo); refreshErr != nil {
+		// Best-effort only: a clone's remotes may change after init. Refresh the
+		// registered URLs before constructing any run-owned Git operation, but keep
+		// the exact prior repo value and continue when discovery, validation, or the
+		// atomic database replacement fails. The reason is deliberately bounded and
+		// URL-free so neither credentials nor sensitive remote material reach logs.
 		slog.Warn("repository URL refresh skipped; continuing with existing registration", "repo_id", repo.ID, "reason", gate.ReasonForRefreshFailure(refreshErr))
 	} else {
 		repo = refreshed
@@ -778,9 +879,26 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 			source = db.RunIntentSourceAgent
 		}
 		runIntent = &db.RunIntent{Summary: storedIntent, Source: source, Score: 1}
+	} else if scope.isQA() {
+		// Nobody stated this run's goal, so it comes from the branch's own
+		// commits. This keeps review's "what was this trying to do" axis without
+		// the intent step reading anyone's local transcripts, and it is stamped
+		// non-authoritative because commit messages are contributor-authored
+		// text rather than an operator contract.
+		if derived := commitDerivedIntent(ctx, m.paths.RepoDir(repo.ID), baseSHA, headSHA); derived != "" {
+			runIntent = &db.RunIntent{
+				Summary: derived,
+				Source:  db.RunIntentSourceCommits,
+				Score:   db.RunIntentScoreCommits,
+			}
+		}
 	}
 
-	run, err := m.db.InsertRunWithIntent(repo.ID, branch, headSHA, baseSHA, runIntent)
+	// The skip declaration is settled before the run row exists, so the row and
+	// the executor can never disagree about what this run intended to run.
+	skipSteps = effectiveSkipSteps(scope, skipSteps)
+
+	run, err := m.db.InsertRunWithScope(repo.ID, branch, headSHA, baseSHA, runIntent, scope.dbScope(skipSteps))
 	if err != nil {
 		trackStartFailure("create_run")
 		return "", fmt.Errorf("create run: %w", err)
@@ -875,8 +993,9 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		// This is not an error: it is the secure default in action.
 		slog.Info("repo commands/agent loaded from default branch, not pushed branch", "run_id", run.ID, "branch", branch, "default_branch", repo.DefaultBranch)
 	}
-	cfg := config.Merge(globalCfg, effectiveRepoCfg)
+	cfg := config.MergeWithRepoPolicy(globalCfg, effectiveRepoCfg, globalCfg.RepoPolicyFor(repoPolicyKey(repo)))
 	cfg.TrustedConfigSHA = trustedSHA
+	cfg = applyRunScopeToConfig(cfg, scope)
 	if globalCfg.Eval.CaptureProvenance {
 		if err := cfg.EnableEvalProvenance(globalCfg, effectiveRepoCfg); err != nil {
 			m.db.UpdateRunError(run.ID, err.Error())
@@ -944,6 +1063,7 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 	runCtx, cancel := context.WithCancelCause(context.Background())
 	executor := pipeline.NewExecutor(m.db, m.paths, cfg, ag, execSteps, m.broadcast)
 	executor.SetSkippedSteps(skipSteps)
+	executor.SetGatePolicy(gatePolicyForRun(run))
 
 	// Track executor.
 	done := make(chan struct{})
@@ -953,8 +1073,9 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 	m.dones[run.ID] = done
 	m.mu.Unlock()
 
-	// Background goroutine now owns worktree cleanup.
+	// Background goroutine now owns worktree cleanup and the run slot.
 	bgOwnsWorktree = true
+	bgOwnsSlot = true
 
 	// Launch pipeline in background.
 	m.wg.Add(1)
@@ -962,6 +1083,9 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 		startedAt := time.Now()
 		defer m.wg.Done()
 		defer close(done)
+		// The slot is held for the whole run, so QA admission reflects work
+		// actually in flight rather than starts attempted.
+		defer releaseSlot()
 		defer func() {
 			if r := recover(); r != nil {
 				errMsg := fmt.Sprintf("internal panic: %v", r)

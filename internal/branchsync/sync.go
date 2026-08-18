@@ -45,6 +45,13 @@ const (
 	// pipeline-created content exists to recover and the exact branch and head
 	// are the operator's, immediately usable with no sync action.
 	StateUserOwned = "user_owned"
+	// StateNotApplicable reports a repository that branch synchronization does
+	// not describe at all: a connected repository has no developer checkout and
+	// no local branch, only a daemon-owned identity stub. It carries no
+	// NextAction on purpose, so recover_custody and user_owned are never offered
+	// for a branch that does not exist, and no Safety, so CanApply is false by
+	// construction rather than by a second copy of the rule.
+	StateNotApplicable = "not_applicable"
 )
 
 const (
@@ -174,6 +181,13 @@ func OpenCurrent() (*Service, func(), error) {
 	if err != nil || repo == nil {
 		database.Close()
 		return nil, nil, fmt.Errorf("repo not initialized")
+	}
+	// This lookup is independent of cli.findRepo, so it needs its own refusal:
+	// without it a connected repository would get a fully wired Service with
+	// Apply and Recover live, which is also what reaches the TUI.
+	if repo.Connected() {
+		database.Close()
+		return nil, nil, fmt.Errorf("%s", connectedRefusalMessage)
 	}
 	return &Service{DB: database, Repo: repo, WorkDir: root, GateDir: p.RepoDir(repo.ID), Paths: p}, func() { _ = database.Close() }, nil
 }
@@ -320,6 +334,28 @@ func (s *Service) Refresh(ctx context.Context) State {
 	return state
 }
 
+// connectedRefusalMessage is the single wording for every branch-sync refusal of
+// a connected repository. It names no URL: a connected repo's URL routinely
+// carries the operator's token.
+const connectedRefusalMessage = "this repository is registered as connected (no developer checkout), so it has no local branch to synchronize; no files or refs were changed"
+
+// connectedRefusal reports that the registered repository is connected rather
+// than a local checkout, mirroring gateContextRefusal below: same signature,
+// same call position at the top of each entry point, same guarantee that nothing
+// was changed. Apply and Recover call it independently rather than trusting
+// derived state, because they are the only worktree-mutating entry points.
+func (s *Service) connectedRefusal() (State, bool) {
+	if !s.Repo.Connected() {
+		return State{}, false
+	}
+	return State{
+		State:    StateNotApplicable,
+		Relation: RelationUnknown,
+		Remote:   RemoteState{Freshness: "unknown"},
+		Error:    connectedRefusalMessage,
+	}, true
+}
+
 func (s *Service) gateContextRefusal(ctx context.Context) (State, bool) {
 	p := s.Paths
 	if p == nil && strings.TrimSpace(s.GateDir) != "" {
@@ -346,6 +382,9 @@ func (s *Service) gateContextRefusal(ctx context.Context) (State, bool) {
 // use a strict fast-forward. Equivalent-diverged branches first anchor the
 // pre-sync head, then move to the verified equivalent pipeline head.
 func (s *Service) Apply(ctx context.Context) State {
+	if refusal, blocked := s.connectedRefusal(); blocked {
+		return refusal
+	}
 	if refusal, blocked := s.gateContextRefusal(ctx); blocked {
 		return refusal
 	}
@@ -506,6 +545,9 @@ func (s *Service) Apply(ctx context.Context) State {
 // run_pipeline as the next step. `no-mistakes rerun` remains the alternative
 // exit that resumes validating the preserved head instead of taking it back.
 func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
+	if refusal, blocked := s.connectedRefusal(); blocked {
+		return refusal
+	}
 	if refusal, blocked := s.gateContextRefusal(ctx); blocked {
 		return refusal
 	}
@@ -910,6 +952,11 @@ func recoverLocalAnchorRef(runID string) string {
 }
 
 func (s *Service) inspect(ctx context.Context) (State, *db.Run, bool) {
+	// A connected repository has no local branch at all, so every state below
+	// would be a claim about a checkout that does not exist.
+	if refusal, blocked := s.connectedRefusal(); blocked {
+		return refusal, nil, false
+	}
 	state := State{Relation: RelationUnknown, Safety: "blocked_ambiguous_context", Remote: RemoteState{Freshness: "unknown"}}
 	root, err := git.FindGitRoot(s.workDir())
 	if err != nil {

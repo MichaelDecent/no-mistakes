@@ -19,6 +19,13 @@ const (
 	RefreshAmbiguousRemote  RefreshFailureReason = "ambiguous_remote"
 	RefreshInvalidRemote    RefreshFailureReason = "invalid_remote"
 	RefreshDatabaseWrite    RefreshFailureReason = "database_write"
+	// RefreshConfigMismatch reports that clone-discovery refresh was asked to
+	// run against a repository whose URLs are owned by configuration, not by a
+	// developer clone.
+	RefreshConfigMismatch RefreshFailureReason = "config_mismatch"
+	// RefreshGateWrite reports that the gate's own origin remote could not be
+	// updated, leaving the registration unreconciled.
+	RefreshGateWrite RefreshFailureReason = "gate_write"
 )
 
 type repoURLRefreshError struct {
@@ -53,6 +60,16 @@ func refreshFailure(reason RefreshFailureReason) error {
 func RefreshRepoURLs(ctx context.Context, database *db.DB, repo *db.Repo) (*db.Repo, bool, error) {
 	if database == nil || repo == nil || strings.TrimSpace(repo.WorkingPath) == "" {
 		return nil, false, refreshFailure(RefreshRemoteUnreadable)
+	}
+	// SECURITY: a connected repository's URLs are owned by the operator's
+	// configuration, never by anything on disk. Its working_path is a refless
+	// identity stub with no remotes, and the only thing on disk holding a URL is
+	// the bare gate's origin - which by design carries the FULL credentialled
+	// URL. Running clone discovery here would read that credential and persist
+	// it through ReplaceRepoURLs, destroying the redaction invariant in one run.
+	// See RefreshConnectedRepoURLs for the path that does own this.
+	if repo.Connected() {
+		return nil, false, refreshFailure(RefreshConfigMismatch)
 	}
 
 	originURLs, err := git.GetConfiguredRemoteURLs(ctx, repo.WorkingPath, "origin")

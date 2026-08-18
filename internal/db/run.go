@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -62,11 +63,22 @@ type Run struct {
 	IntentSource    *string
 	IntentSessionID *string
 	IntentScore     *float64
-	CreatedAt       int64
-	UpdatedAt       int64
+	// RunKind and RunMode are nullable: every row written before QA existed reads
+	// back empty, which types.NormalizeRunKind/NormalizeRunMode resolve to the
+	// author gate in fix-pr mode - exactly what those rows were.
+	RunKind string
+	RunMode string
+	// SkippedSteps is the JSON array of step names this run DECLARED it would
+	// not run, recorded at run start before any step executed. It is nil for
+	// every gate run and for every row written before QA existed. The step rows
+	// remain the record of what actually happened; this is the declaration, and
+	// crash recovery reinstalls the run's skips from it.
+	SkippedSteps *string
+	CreatedAt    int64
+	UpdatedAt    int64
 }
 
-const runColumns = `id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, created_at, updated_at`
+const runColumns = `id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, COALESCE(run_kind, ''), COALESCE(run_mode, ''), skipped_steps, created_at, updated_at`
 
 func scanRun(row interface {
 	Scan(...any) error
@@ -78,6 +90,7 @@ func scanRun(row interface {
 		&r.LastPushedAt, &r.PushGeneration, &r.PushActive, &r.TerminalHeadVerifiedAt,
 		&r.CustodyReturnedAt, &r.Error, &r.AwaitingAgentSince, &r.ParkedMS,
 		&r.Intent, &r.IntentSource, &r.IntentSessionID, &r.IntentScore,
+		&r.RunKind, &r.RunMode, &r.SkippedSteps,
 		&r.CreatedAt, &r.UpdatedAt,
 	)
 }
@@ -88,6 +101,10 @@ func (d *DB) InsertRun(repoID, branch, headSHA, baseSHA string) (*Run, error) {
 }
 
 func (d *DB) InsertRunWithIntent(repoID, branch, headSHA, baseSHA string, intent *RunIntent) (*Run, error) {
+	return d.insertRun(repoID, branch, headSHA, baseSHA, intent, RunScope{})
+}
+
+func (d *DB) insertRun(repoID, branch, headSHA, baseSHA string, intent *RunIntent, scope RunScope) (*Run, error) {
 	ts := now()
 	version := buildinfo.CurrentVersion()
 	buildSHA := buildinfo.Commit
@@ -101,6 +118,9 @@ func (d *DB) InsertRunWithIntent(repoID, branch, headSHA, baseSHA string, intent
 		NoMistakesVersion:  &version,
 		NoMistakesBuildSHA: &buildSHA,
 		Status:             types.RunPending,
+		RunKind:            string(scope.Kind),
+		RunMode:            string(scope.Mode),
+		SkippedSteps:       marshalSkippedSteps(scope.SkippedSteps),
 		CreatedAt:          ts,
 		UpdatedAt:          ts,
 	}
@@ -110,14 +130,72 @@ func (d *DB) InsertRunWithIntent(repoID, branch, headSHA, baseSHA string, intent
 		r.IntentSessionID = &intent.SessionID
 		r.IntentScore = &intent.Score
 	}
+	// A gate run writes NULL for all three scope columns, exactly as every row
+	// written before QA existed did, so nothing about the gate path changes.
+	var kind, mode *string
+	if r.RunKind != "" {
+		kind = &r.RunKind
+	}
+	if r.RunMode != "" {
+		mode = &r.RunMode
+	}
 	_, err := d.sql.Exec(
-		`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, status, pr_state, intent, intent_source, intent_session_id, intent_score, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, headSHA, r.NoMistakesVersion, r.NoMistakesBuildSHA, r.Status, r.Intent, r.IntentSource, r.IntentSessionID, r.IntentScore, r.CreatedAt, r.UpdatedAt,
+		`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, status, pr_state, intent, intent_source, intent_session_id, intent_score, run_kind, run_mode, skipped_steps, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, headSHA, r.NoMistakesVersion, r.NoMistakesBuildSHA, r.Status, r.Intent, r.IntentSource, r.IntentSessionID, r.IntentScore, kind, mode, r.SkippedSteps, r.CreatedAt, r.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert run: %w", err)
 	}
 	return r, nil
+}
+
+// RunScope is the declared scope a run is created under: which mechanism
+// started it, what it may do with what it finds, and which steps it declared it
+// would not run. The zero value is a gate run, which is why the gate path can
+// keep calling InsertRunWithIntent and write nothing new.
+type RunScope struct {
+	Kind         types.RunKind
+	Mode         types.RunMode
+	SkippedSteps []types.StepName
+}
+
+// InsertRunWithScope creates a run that records its kind, mode, and skip
+// declaration alongside everything InsertRunWithIntent writes.
+//
+// The three columns are written in the SAME statement as the run itself, not by
+// a follow-up UPDATE: a run whose scope arrived a moment after its row would be
+// readable as a gate run in between, and a gate run is the widest scope there is.
+func (d *DB) InsertRunWithScope(repoID, branch, headSHA, baseSHA string, intent *RunIntent, scope RunScope) (*Run, error) {
+	return d.insertRun(repoID, branch, headSHA, baseSHA, intent, scope)
+}
+
+// SkippedStepNames decodes the run's skip declaration. An absent or unreadable
+// declaration yields none, so the run is treated as skipping nothing - which
+// runs the FULL pipeline, the only safe direction to degrade in.
+func (r *Run) SkippedStepNames() []types.StepName {
+	if r == nil || r.SkippedSteps == nil || *r.SkippedSteps == "" {
+		return nil
+	}
+	var names []types.StepName
+	if err := json.Unmarshal([]byte(*r.SkippedSteps), &names); err != nil {
+		return nil
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
+}
+
+func marshalSkippedSteps(steps []types.StepName) *string {
+	if len(steps) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(steps)
+	if err != nil {
+		return nil
+	}
+	value := string(encoded)
+	return &value
 }
 
 // GetRun returns a run by ID.
@@ -504,6 +582,20 @@ const RunIntentSourceAgent = "agent"
 // selected for a rerun. It remains authoritative, but the distinct value keeps
 // inherited intent inspectable instead of confusing it with a new override.
 const RunIntentSourceRerun = "rerun"
+
+// RunIntentSourceCommits marks an intent derived from the branch's own commit
+// messages at run creation. It is how a QA run gets the "what was this trying to
+// do" axis without reading anyone's local transcripts - a connected repository
+// has no author sitting at this machine.
+//
+// It is deliberately NOT authoritative: commit messages are contributor-authored
+// text, not an operator contract, so prompts frame it as a low-confidence hint.
+// IsAuthoritativeRunIntentSource is a whitelist, so this holds by construction.
+const RunIntentSourceCommits = "commits"
+
+// RunIntentScoreCommits is the confidence stamped on a commit-derived intent.
+// Below an explicit intent's 1, above nothing at all.
+const RunIntentScoreCommits = 0.5
 
 // IsAuthoritativeRunIntentSource reports whether a run's intent came from an
 // explicit operator/agent contract, either directly or through rerun

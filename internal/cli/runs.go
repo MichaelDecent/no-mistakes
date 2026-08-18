@@ -11,6 +11,7 @@ import (
 
 func newRunsCmd() *cobra.Command {
 	var limit int
+	var repoSelector string
 
 	cmd := &cobra.Command{
 		Use:   "runs",
@@ -24,7 +25,11 @@ func newRunsCmd() *cobra.Command {
 				}
 				defer d.Close()
 
-				repo, err := findRepo(d)
+				// Reading a connected repository's runs is legitimate - it is what
+				// an operator needs after a QA run - so an explicit --repo resolves
+				// one. Only cwd-based selection refuses them, because a connected
+				// repository is not what any directory is "in".
+				repo, err := resolveRepo(d, repoSelector)
 				if err != nil {
 					return "", "", err
 				}
@@ -64,6 +69,7 @@ func newRunsCmd() *cobra.Command {
 	}
 
 	cmd.Flags().IntVar(&limit, "limit", 10, "maximum number of runs to display")
+	cmd.Flags().StringVar(&repoSelector, "repo", "", "repository name, ID, or unique ID prefix (default: the current directory's repository)")
 	return cmd
 }
 

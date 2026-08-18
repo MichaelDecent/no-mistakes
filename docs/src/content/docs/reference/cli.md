@@ -361,13 +361,63 @@ List recorded pipeline runs for the current repo.
 
 ```sh
 no-mistakes runs [--limit <n>]
+no-mistakes runs --repo acme-api
 ```
 
-| Flag      | Type  | Default | Description                       |
-| --------- | ----- | ------- | --------------------------------- |
-| `--limit` | `int` | `10`    | Maximum number of runs to display |
+| Flag      | Type     | Default          | Description                                                      |
+| --------- | -------- | ---------------- | ---------------------------------------------------------------- |
+| `--limit` | `int`    | `10`             | Maximum number of runs to display                                |
+| `--repo`  | `string` | current repo     | Repository name, ID, or unique ID prefix, including a connected one |
 
 Shows runs newest-first with branch, status (styled), short SHA, timestamp, and PR URL if set.
+
+## no-mistakes repos
+
+Manage connected repositories: the ones declared by remote URL under `repos:` in `config.yaml`, with no
+local checkout.
+
+```sh
+no-mistakes repos list
+no-mistakes repos reconcile
+no-mistakes repos show <name>
+no-mistakes repos remove <name>
+```
+
+`reconcile` brings the registry in line with what `config.yaml` declares. It is strictly additive: an entry
+you delete from configuration is *detached*, never destroyed, so its gate and run history survive and
+re-declaring the same URL reattaches it with the same identity. Author-side commands do not apply to a
+connected repository — see [QA Mode](/no-mistakes/concepts/qa/).
+
+## no-mistakes qa run
+
+Run the pipeline once against a connected repository's branch, without a checkout and without a push.
+
+```sh
+no-mistakes qa run --repo acme-api
+no-mistakes qa run --repo acme-api --branch release/2.1
+no-mistakes qa run --repo acme-api --mode fix-pr --yes
+```
+
+`--repo` is required and accepts the operator-chosen name, the full repository ID, or a unique ID prefix; an
+ambiguous prefix is refused rather than guessed. Without `--branch` the repository's default branch is
+validated. The branch is fetched into the repository's gate first, since a connected gate receives no
+pushes.
+
+`--mode` defaults to `report` — not to `qa.default_mode`, which is what an unattended *watch* inherits.
+`report` and `comment` validate read-only: their approval gates are answered automatically, they carry no
+auto-fix budget, and they skip the steps that write files or touch the remote. `fix-pr` is the only mode
+that writes code; it prints exactly what it may write and requires `--yes`.
+
+QA refuses a local repository, and a QA run never supersedes an active gate run on the same branch: the
+author's push is newer truth and has a person waiting on it. Mode semantics are owned by
+[QA Mode](/no-mistakes/concepts/qa/).
+
+| Flag | Type | Default | Description |
+| ---- | ---- | ------- | ----------- |
+| `--repo` | `string` | (required) | Connected repository name, ID, or unique ID prefix |
+| `--branch` | `string` | default branch | Branch to validate |
+| `--mode` | `string` | `report` | `report`, `comment`, or `fix-pr` |
+| `--yes` | `bool` | `false` | Consent to a code-writing run; required with `--mode fix-pr` |
 
 ## no-mistakes eval
 
