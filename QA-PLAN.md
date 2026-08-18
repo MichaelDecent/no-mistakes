@@ -17,17 +17,30 @@
 `claude/qa-agent-multi-repo-plan-siv96n`, base `main`. Do **not** open another PR; pushing to this
 branch updates it. Pushing works — the earlier `403` is resolved.
 
-**⚠ GitHub Actions is disabled on this fork, so PR #1 has NO automated verification.**
-`list_workflows` returns `total_count: 0` and the PR reports zero check runs with a `pending` combined
-status, even though `.github/workflows/ci.yml` is present in the tree and its `pull_request` trigger
-matches `main`. This is the default for a newly created fork — the workflows exist but are not
-registered until the owner enables Actions (repo **Settings → Actions → General**, or the "I understand
-my workflows, go ahead and enable them" banner on the Actions tab).
+**✅ GitHub Actions is now ENABLED on this fork and CI runs on every push to PR #1.** (It was disabled
+until the owner turned it on; the earlier note claiming there is no automated verification is obsolete.)
 
-Consequence to carry: the claim that the eight failures below are environmental rests **only** on the
-stash-and-rerun comparison in this container. Nothing has verified it on Linux CI, and until Actions is
-enabled nothing will — including the `go test -race ./...` broad-regression leg that
-`AGENTS.md` designates as the owner of full regression coverage.
+First real signal, run 4 on `9edef0c`: `check`, `e2e`, `build`, the generated-files guard, and
+**`test (ubuntu-latest)`** all green. That confirms the container-only failures listed below are exactly
+that — the `go test -race ./...` Linux leg, which `AGENTS.md` designates as the owner of full regression
+coverage, passes on CI while five process-reaping tests fail in this sandbox.
+
+Two legs failed and one is a policy check:
+
+- **macOS**: five tests across `internal/branchsync`, `internal/cli`, and `internal/gate`, all one root
+  cause — a connected registration stored the identity stub's path unresolved while every path-keyed
+  lookup resolves it first (macOS aliases `/var` to `/private/var`). Fixed in `16944c5`.
+- **Windows**: failed for reasons the log does not reveal. The Windows leg runs `go test -v`, which
+  produces a log whose failing section is far outside the tail the GitHub API will return, and the full
+  log archive host is blocked by this container's proxy. Most likely the same path-alias class (Windows
+  temp dirs carry 8.3 short names, which `FindGitRoot`'s `EvalSymlinks` expands), so `16944c5` is the
+  first thing to check against. **If Windows still fails, make the leg diagnosable before chasing it** —
+  dropping `-v` would put failures back in the retrievable tail, and the workflow contract test only pins
+  `-timeout`, not `-v`.
+- **`PR must be raised via no-mistakes`**: expected and not fixable from the code. That workflow requires
+  the PR body to carry the marker `Updates from [git push no-mistakes](...)`, which only the tool's own PR
+  step writes. PR #1 was raised by hand. Do **not** paste the marker in: the check exists to assert the
+  PR came through the pipeline, and writing it manually would make the check lie.
 
 Three corrections landed during Phase 1 and are already reflected below: `rebase` and `intent` are
 NOT skipped in QA modes (verified: `rebase.go` has zero `git.Push*` calls and aborts on conflict;
