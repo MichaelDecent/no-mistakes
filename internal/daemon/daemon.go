@@ -202,6 +202,13 @@ func runWithOptionsLocked(p *paths.Paths, d *db.DB, stepFactory StepFactory, sta
 	defer agent.SetServerPIDsDir("")
 
 	mgr := NewRunManager(d, p, stepFactory)
+	// Size the run slots from the operator's qa block before anything can be
+	// admitted. Best effort: an unreadable config already failed the startup
+	// path above, and a manager that keeps its conservative defaults still
+	// counts interactive runs correctly.
+	if qaCfg, cfgErr := config.LoadGlobal(p.ConfigFile()); cfgErr == nil {
+		mgr.ApplyQAConfig(qaCfg.QA)
+	}
 
 	// Publish process identity as soon as the singleton lock is held. Startup
 	// callers can now distinguish a launched child from IPC readiness and detect
@@ -625,15 +632,23 @@ func migrateGateConfig(ctx context.Context, bareDir string) error {
 	return nil
 }
 
+// inspectGateContext is the one classification call every ingress makes.
+// internal/gatecontext remains the single classifier; this indirection exists so
+// a test can force the nested verdict without reproducing a live gate step's
+// process ancestry, and nothing in production replaces it.
+var inspectGateContext = func(ctx context.Context, d *db.DB, p *paths.Paths, cwd string, markerPresent, skipManagedGit bool) (gatecontext.Result, error) {
+	return (gatecontext.Inspector{DB: d, Paths: p}).Inspect(ctx, gatecontext.Request{
+		CWD:            cwd,
+		PeerPID:        ipc.PeerPID(ctx),
+		DaemonPID:      os.Getpid(),
+		MarkerPresent:  markerPresent,
+		SkipManagedGit: skipManagedGit,
+	})
+}
+
 func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func()) {
 	classify := func(ctx context.Context, cwd string, markerPresent, skipManagedGit bool) (gatecontext.Result, error) {
-		return (gatecontext.Inspector{DB: d, Paths: mgr.paths}).Inspect(ctx, gatecontext.Request{
-			CWD:            cwd,
-			PeerPID:        ipc.PeerPID(ctx),
-			DaemonPID:      os.Getpid(),
-			MarkerPresent:  markerPresent,
-			SkipManagedGit: skipManagedGit,
-		})
+		return inspectGateContext(ctx, d, mgr.paths, cwd, markerPresent, skipManagedGit)
 	}
 	refuseNested := func(ctx context.Context, skipManagedGit bool) error {
 		result, err := classify(ctx, "", false, skipManagedGit)
@@ -797,6 +812,29 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 			return nil, err
 		}
 		return &ipc.RerunResult{RunID: runID}, nil
+	})
+
+	// A QA run is a mutation, so it goes through the same nested refusal as
+	// rerun: a gate step running inside a pipeline must not be able to start QA
+	// work recursively.
+	srv.Handle(ipc.MethodQARun, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		if err := refuseNested(ctx, false); err != nil {
+			return nil, err
+		}
+		var p ipc.QARunParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		runID, err := mgr.StartQARun(ctx, QARunRequest{
+			RepoID:  p.RepoID,
+			Branch:  p.Branch,
+			Mode:    p.Mode,
+			BaseSHA: p.BaseSHA,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &ipc.QARunResult{RunID: runID}, nil
 	})
 
 	srv.Handle(ipc.MethodPushReceived, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
